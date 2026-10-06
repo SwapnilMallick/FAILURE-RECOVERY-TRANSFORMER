@@ -13,6 +13,7 @@ env/
 
 # Experiment outputs and model artifacts
 fallback_results/
+fallback_results_2/
 *_results/
 *.pt
 *.pth

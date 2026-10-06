@@ -12,36 +12,40 @@ Method (single fall-back iteration)
     repeat (one "round"):
         collect k m-step exploration trajectories from `start`; at every step
             a ~ uniform collision-free action (world.sample_free)
-            accept a   iff   Q_TD(h, a)  >  Q_exp(h, a) - mu_exp(h, a)
+            accept a   iff   -mu_TD(h, a)  >  Q_exp(h, a) - mu_exp(h, a)
             (otherwise resample, up to max_retries; if nothing is accepted
              the trajectory ends early)
-        train T_explore on the exploration buffer (all rounds so far)
+        train T_explore on the exploration buffer (all rounds so far); its
+            label for every (h_t, a_t) is T_D's certainty there, -mu_TD(h_t, a_t)
         frontier = end states of the k trajectories
         s* = argmax_{s in frontier}  Q_TD(s) + mu_TD(s)
         chain  <- chain + the trajectory that ended at s*
-        stop   if  s* is within fallback_eps of some tau_1 state   (fell back)
+        stop   if  mu_TD(s*) ~ 0, i.e. mu_TD(s*) < mu_tol  (T_D is certain at s*:
+               it looks like a tau_1 state)
         start <- s*  (with the history of the trajectory that reached it)
-    tau_2 = chain = s_1 -> s*_1 -> s*_2 -> ... -> s*_last (on tau_1); D <- D U {tau_2}
-    There is no merging of similar states. A trajectory merely passing near
-    tau_1 does not stop anything -- only s* is tested. The document's
-    Q-agreement rule |Q_TD(s*) - (Q_exp(s*) - mu_exp(s*))| < converge_tol is
-    logged every round and can be enabled as an extra stop (--stop-on-qgap),
-    but it then ends the iteration WITHOUT a tau_2.
+    tau_2 = chain = s_1 -> s*_1 -> s*_2 -> ... -> s*_last ; D <- D U {tau_2}
+    There is no merging of similar states. EEF distance to tau_1 is logged
+    as a diagnostic only; it never stops anything.
 
 Interpretation choices (the method text leaves these open)
 ----------------------------------------------------------
-  * Q-value. Reward is 1 on the transition that reaches the cube (within
-    eps_dist) and 0 otherwise, discount gamma. On tau_1 (length T) the label
-    of token t = [emb(s_t), a_t] is the Monte-Carlo return gamma^(T-1-t).
-  * T_explore labels. Exploration trajectories usually do not reach the goal,
-    so each token gets the n-step return bootstrapped from T_D at the
-    trajectory's last token:  gamma^(n-1-t) * Q_TD(h_{n-1}, a_{n-1})
-    (or the true return gamma^(n-1-t) if the trajectory does reach the cube).
+  * Q-value (T_D only). Reward is 1 on the transition that reaches the cube
+    (within eps_dist) and 0 otherwise, discount gamma. On tau_1 (length T)
+    the label of token t = [emb(s_t), a_t] is the Monte-Carlo return
+    gamma^(T-1-t). Q_TD is used only to pick s*.
+  * Acceptance rule. The update reads "mu_TD > Q_exp - mu_exp", but T_explore
+    is trained on -mu_TD <= 0, so that would accept almost every action; it
+    is implemented as certainty vs certainty, -mu_TD > Q_exp - mu_exp
+    (confirmed with the author): take an action when T_D is more certain
+    about it than T_explore's pessimistic estimate of T_D's certainty there.
+  * T_explore labels. -mu_TD for every prefix of the trajectory (history
+    included), from ONE batched MC-dropout pass over the whole sequence --
+    the causal mask makes position t's output depend only on tokens[:t+1].
     T_D is frozen during the iteration, so labels are computed once, at
-    collection time. T_explore therefore learns "what value exploration has
-    actually achieved from here"; the acceptance rule keeps actions that T_D
-    rates at least as highly as that, optimistically discounted by T_explore's
-    uncertainty, and the stop rule fires once the two agree at s*.
+    collection time. Q_exp = mean of the n MC-dropout passes of T_explore.
+  * Stop tolerance. "mu_TD ~ 0" is mu_TD(s*) < mu_tol; by default mu_tol is
+    the largest mu_TD T_D shows on tau_1 itself (as certain as T_D is on the
+    trajectory it was trained on). --mu-tol overrides it.
   * Q(s) of a frontier state is read from the trajectory's LAST token
     (the action that led into it); with deterministic, zero-reward
     transitions Q(s_{n-1}, a_{n-1}) = gamma * V(s_n).
@@ -50,6 +54,14 @@ Interpretation choices (the method text leaves these open)
     trained on every suffix tau_1[i:] (labels unchanged), so it does not only
     know tau_1 states at the absolute positions they occupy in tau_1 --
     exploration histories start at s_1 / s*, not s_0.
+  * Step sizes. tau_1 moves script_step (1 cm) per step, ~19 states for the
+    ~0.22 m start-to-cube distance. Exploration actions are drawn uniformly
+    from the ball of radius action_step, set to the same 1 cm, so T_D (which
+    only sees tau_1's actions) is not queried on actions far larger than any
+    it was trained on. gamma = 0.97 keeps Q at s_0 (gamma^(T-1) ~ 0.58)
+    clear of zero over the longer horizon. The encoder's calibration random
+    walk keeps the world's default 4 cm step so its standardization stats
+    cover the same workspace region regardless of action_step.
   * s_1 is s_0's EEF displaced by a random direction with norm in
     [s1_min_dist, s1_max_dist], IK-reachable and collision-free.
 
@@ -57,7 +69,7 @@ Tokens are [ DINOv2 embeddings of agentview/sideview/frontview (V*D) , EEF
 displacement action (3) ], exactly as in the rest of this project
 (image_encoder.ImageEncoder + online_cost_transformer.ImageCostTransformer).
 EEF xyz is never a model input; it is used only for the scripted policy, the
-goal check and the fall-back diagnostics (distance to tau_1).
+goal check, tau_2's labels and the diagnostics (distance to tau_1).
 
 Usage:
     python fallback_explore.py                      # defaults
@@ -82,7 +94,8 @@ from image_encoder import EncoderConfig, ImageEncoder
 from online_cost_transformer import (
     ImageCostTransformer, causal_mask, collate, fuse, huber_loss, predict_last_mc,
 )
-from task import RobosuiteTask
+from robosuite_env import WorldConfig
+from task import RobosuiteTask, TaskConfig
 
 
 @dataclass
@@ -103,10 +116,10 @@ class FallbackConfig:
     token_fusion: str = "concat"
 
     # --- Q-values ---
-    gamma: float = 0.9
+    gamma: float = 0.97
 
     # --- tau_1 (scripted policy) + T_D ---
-    script_step: float = 0.03            # m per scripted step (<= world step_size)
+    script_step: float = 0.01            # m per scripted step (<= action_step)
     script_max_steps: int = 60
     td_epochs: int = 400
     td_suffix_aug: bool = True
@@ -116,14 +129,14 @@ class FallbackConfig:
     s1_max_dist: float = 0.08
 
     # --- exploration ---
+    action_step: float = 0.01            # exploration action bound (m), = world step_size
     k: int = 8                           # trajectories per round
     m: int = 10                          # steps per trajectory
     max_retries: int = 10                # action resamples per step
     explore_epochs: int = 60             # T_explore epochs per round
     max_rounds: int = 10
-    fallback_eps: float = 0.02           # s* "on tau_1" if this close to a tau_1 state (m)
-    stop_on_qgap: bool = False           # also stop on the Q-agreement rule (no tau_2)
-    converge_tol: float = 0.02           # |Q_TD - (Q_exp - mu_exp)| at s*
+    mu_tol: Optional[float] = None       # stop when mu_TD(s*) < mu_tol;
+                                         # None = max mu_TD on tau_1
 
     seed: int = 0
 
@@ -218,6 +231,19 @@ def sample_nearby_start(task: RobosuiteTask, cfg: FallbackConfig, rng, tries: in
 # --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
+@torch.no_grad()
+def mc_all(model, tokens: List[np.ndarray], cfg: FallbackConfig):
+    """MC-dropout (mean, std) at EVERY position of one sequence (its last
+    max_len tokens) in a single batched pass -- predict_last_mc for all
+    prefixes at once, valid because the transformer is causal."""
+    x = torch.tensor(np.array(tokens[-cfg.max_len:]), dtype=torch.float32, device=cfg.device)
+    x = x.unsqueeze(0).repeat(cfg.mc_samples, 1, 1)
+    model.train()                                    # dropout ON
+    c = model(x, causal_mask(x.shape[1], cfg.device), None)
+    model.eval()
+    return c.mean(0).cpu().numpy(), c.std(0, unbiased=True).cpu().numpy()
+
+
 def _window(tokens, labels, max_len):
     return np.asarray(tokens[-max_len:]), np.asarray(labels[-max_len:], float)
 
@@ -266,7 +292,8 @@ def collect_exploration_trajectory(T_D, T_exp, task: RobosuiteTask, encoder: Ima
                                    hist_tokens: List[np.ndarray]) -> Traj:
     """One m-step trajectory from start_q. Candidate actions come from
     world.sample_free (uniform in the step ball, IK-reachable, collision-free);
-    a candidate is taken iff Q_TD > Q_exp - mu_exp."""
+    a candidate is taken iff -mu_TD > Q_exp - mu_exp. Labels for T_explore
+    are -mu_TD at every position."""
     ik, world = task.ik, task.world
     task.reset_to_start()
     ik.set_q(start_q)
@@ -283,9 +310,9 @@ def collect_exploration_trajectory(T_D, T_exp, task: RobosuiteTask, encoder: Ima
                 continue
             a, _s_next, q_to = cand
             tok = fuse(emb.reshape(-1), a)
-            q_d, _ = predict_last_mc(T_D, tokens + [tok], cfg)
+            _, mu_d = predict_last_mc(T_D, tokens + [tok], cfg)
             q_e, mu_e = predict_last_mc(T_exp, tokens + [tok], cfg)
-            if q_d > q_e - mu_e:
+            if -mu_d > q_e - mu_e:
                 accepted = (tok, q_to)
                 break
             tr.n_reject += 1
@@ -305,13 +332,12 @@ def collect_exploration_trajectory(T_D, T_exp, task: RobosuiteTask, encoder: Ima
             break
 
     tr.end_emb = emb
-    n = len(tokens)
     if tr.n_new > 0:
-        if tr.reached:
-            boot = 1.0
-        else:
-            boot, _ = predict_last_mc(T_D, tokens, cfg)
-        tr.labels = boot * cfg.gamma ** (n - 1 - np.arange(n, dtype=float))
+        # the caller trims history to max_len - m, so the whole sequence fits
+        # in one window and every token gets a label
+        assert len(tokens) <= cfg.max_len
+        _, mu_all = mc_all(T_D, tokens, cfg)
+        tr.labels = -mu_all.astype(float)
     return tr
 
 
@@ -322,8 +348,9 @@ def min_dist_to(points: List[np.ndarray], ref: np.ndarray) -> float:
 
 def build_tau2(chain_tokens, chain_eefs, chain_qs, end_emb, tau1: Traj, tau1_pts,
                cfg: FallbackConfig) -> Traj:
-    """tau_2 = s_1 -> s*_1 -> ... -> s*_last, where s*_last is within
-    fallback_eps of tau_1 state j. Labelled so it is a valid D entry for a
+    """tau_2 = s_1 -> s*_1 -> ... -> s*_last, where T_D is certain at s*_last.
+    It joins tau_1 at the nearest tau_1 state j (by EEF position; the
+    distance is logged). Labelled so it is a valid D entry for a
     later iteration: tau_1 gives V(s_j) = gamma^(T-1-j) (=1 at the goal state
     j=T, see collect_scripted_trajectory), so the last tau_2 token gets
     gamma * V(s_j) = gamma^(T-j) (1 if j == T) and earlier tokens are
@@ -341,7 +368,7 @@ def build_tau2(chain_tokens, chain_eefs, chain_qs, end_emb, tau1: Traj, tau1_pts
 # Plotting
 # --------------------------------------------------------------------------- #
 def save_plots(outdir, tau1: Traj, s1_eef, rounds_trajs, s_stars, rows, cube,
-               chain_eefs, eps):
+               chain_eefs, mu_tol, made_tau2):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -366,8 +393,7 @@ def save_plots(outdir, tau1: Traj, s1_eef, rounds_trajs, s_stars, rows, cube,
                    label=r"$s^*$ per round")
     C = np.asarray(chain_eefs)
     ax.plot(C[:, 0], C[:, 1], C[:, 2], color="tab:red", lw=2.2,
-            label=r"chain $s_1 \to s^*$" + (r" ($\tau_2$)" if rows and
-                                              rows[-1]["sstar_dist_tau1"] < eps else ""))
+            label=r"chain $s_1 \to s^*$" + (r" ($\tau_2$)" if made_tau2 else ""))
     ax.scatter(*cube, color="tab:red", s=80, label="cube")
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
     ax.legend(fontsize=7, loc="upper left")
@@ -375,14 +401,17 @@ def save_plots(outdir, tau1: Traj, s1_eef, rounds_trajs, s_stars, rows, cube,
 
     ax2 = fig.add_subplot(1, 2, 2)
     rr = [r["round"] for r in rows]
-    ax2.plot(rr, [r["q_td_sstar"] for r in rows], "o-", label=r"$\hat Q_{T_D}(s^*)$")
-    ax2.plot(rr, [r["q_exp_sstar"] - r["mu_exp_sstar"] for r in rows], "s-",
-             label=r"$\hat Q_{T_{exp}} - \mu_{T_{exp}}$ at $s^*$")
-    ax2.plot(rr, [r["sstar_dist_tau1"] for r in rows], "^--", color="gray",
+    ax2.plot(rr, [r["mu_td_sstar"] for r in rows], "o-", label=r"$\mu_{T_D}(s^*)$")
+    ax2.axhline(mu_tol, color="tab:red", ls=":", lw=1, label=r"mu_tol (stop)")
+    ax2.set_xlabel("round"); ax2.set_ylabel(r"$\mu_{T_D}$"); ax2.grid(alpha=0.3)
+    ax3 = ax2.twinx()
+    ax3.plot(rr, [r["sstar_dist_tau1"] for r in rows], "^--", color="gray",
              label=r"dist($s^*$, $\tau_1$) [m]")
-    ax2.axhline(eps, color="tab:red", ls=":", lw=1, label=r"$\epsilon$ (stop)")
-    ax2.set_xlabel("round"); ax2.legend(fontsize=8); ax2.grid(alpha=0.3)
-    ax2.set_title(r"Q at $s^*$ and distance of $s^*$ to $\tau_1$")
+    ax3.set_ylabel("m")
+    h1, l1 = ax2.get_legend_handles_labels()
+    h2, l2 = ax3.get_legend_handles_labels()
+    ax2.legend(h1 + h2, l1 + l2, fontsize=8)
+    ax2.set_title(r"T_D uncertainty at $s^*$ (stop rule) and distance to $\tau_1$")
     fig.tight_layout()
     path = os.path.join(outdir, "fallback.png")
     fig.savefig(path, dpi=120)
@@ -407,14 +436,23 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
         logf.flush()
 
     t0 = time.time()
-    task = RobosuiteTask(seed=cfg.seed, enable_render=True)
+    task = RobosuiteTask(TaskConfig(world=WorldConfig(step_size=cfg.action_step)),
+                         seed=cfg.seed, enable_render=True)
     encoder = ImageEncoder(enc_cfg)
-    encoder.calibrate(task, calib_rng)
+    # calibrate on the default-step random walk (see module docstring), then
+    # restore the exploration action bound
+    task.world.cfg.step_size = WorldConfig().step_size
+    try:
+        encoder.calibrate(task, calib_rng)
+    finally:
+        task.world.cfg.step_size = cfg.action_step
     encoder.save_stats(os.path.join(outdir, "encoder_stats.npz"))
     log(f"task: eef_start={task.eef_start.round(3)} cube={task.cube_pos.round(3)} "
         f"eps={task.cfg.eps_dist} | encoder {enc_cfg.model_name} x {list(enc_cfg.cameras)} "
         f"on {encoder.device}, calibrated on {enc_cfg.n_calib} states")
     log(f"config: {json.dumps(asdict(cfg))}")
+    log(f"step sizes: demo {cfg.script_step} m/step, exploration actions <= "
+        f"{task.world.cfg.step_size} m, gamma {cfg.gamma}")
 
     def new_model():
         return ImageCostTransformer(
@@ -438,6 +476,9 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
     log(f"T_D trained ({cfg.td_epochs} epochs, final loss {loss_d:.2e}); "
         f"fit on tau_1 (label / Q_TD +- mu):")
     log("   " + "  ".join(f"{l:.3f}/{q:.3f}+-{s:.3f}" for l, (q, s) in zip(tau1.labels, q_fit)))
+    mu_tol = cfg.mu_tol if cfg.mu_tol is not None else max(sd for _, sd in q_fit)
+    log(f"stop when mu_TD(s*) < mu_tol = {mu_tol:.4f}"
+        f"{'' if cfg.mu_tol is not None else '  (max mu_TD on tau_1)'}")
 
     # ---- s_1 ----
     q1, s1_eef = sample_nearby_start(task, cfg, rng)
@@ -456,7 +497,7 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
     stop_reason = "max_rounds"
 
     hdr = (f"{'rnd':>3} {'steps':>5} {'stuck':>5} {'rej':>5} {'sfail':>5} {'reach':>5} "
-           f"{'loss_exp':>9} {'Q_TD*':>7} {'Q_exp*':>7} {'mu_exp*':>7} {'gap':>7} "
+           f"{'loss_exp':>9} {'Q_TD*':>7} {'mu_TD*':>7} {'Q_exp*':>7} {'mu_exp*':>7} "
            f"{'d(s*,t1)':>8} {'dmin,t1':>8} {'sec':>6}")
     log("\n" + hdr)
     for rnd in range(1, cfg.max_rounds + 1):
@@ -476,14 +517,11 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
             stop_reason = "stuck"
             log(f"{rnd:>3}  every trajectory was stuck at its first step -- stopping")
             break
-        scores = []
-        for t in frontier:
-            q_d, mu_d = predict_last_mc(T_D, t.tokens, cfg)
-            scores.append(q_d + mu_d)
-        best = frontier[int(np.argmax(scores))]
-        q_d, _ = predict_last_mc(T_D, best.tokens, cfg)
+        td = [predict_last_mc(T_D, t.tokens, cfg) for t in frontier]
+        i_best = int(np.argmax([q + mu for q, mu in td]))
+        best = frontier[i_best]
+        q_d, mu_d = td[i_best]
         q_e, mu_e = predict_last_mc(T_exp, best.tokens, cfg)
-        gap = q_d - (q_e - mu_e)
         s_star = best.eefs[-1]
         s_stars.append(s_star)
         rounds_trajs.append(trajs)
@@ -499,7 +537,8 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
             rejects=int(sum(t.n_reject for t in trajs)),
             sample_fails=int(sum(t.n_sample_fail for t in trajs)),
             reached=int(sum(t.reached for t in trajs)),
-            loss_exp=loss_e, q_td_sstar=q_d, q_exp_sstar=q_e, mu_exp_sstar=mu_e, gap=gap,
+            loss_exp=loss_e, q_td_sstar=q_d, mu_td_sstar=mu_d,
+            q_exp_sstar=q_e, mu_exp_sstar=mu_e,
             sstar=s_star.round(4).tolist(),
             sstar_dist_tau1=min_dist_to([s_star], tau1_pts),
             min_dist_tau1=min_dist_to(new_pts, tau1_pts) if new_pts else float("nan"),
@@ -508,22 +547,17 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
         rows.append(row)
         log(f"{rnd:>3} {row['steps']:>5} {row['stuck']:>5} {row['rejects']:>5} "
             f"{row['sample_fails']:>5} {row['reached']:>5} {loss_e:>9.2e} {q_d:>7.3f} "
-            f"{q_e:>7.3f} {mu_e:>7.3f} {gap:>7.3f} {row['sstar_dist_tau1']:>8.3f} "
+            f"{mu_d:>7.4f} {q_e:>7.3f} {mu_e:>7.3f} {row['sstar_dist_tau1']:>8.3f} "
             f"{row['min_dist_tau1']:>8.3f} {row['sec']:>6.1f}")
 
-        if row["sstar_dist_tau1"] < cfg.fallback_eps:
-            stop_reason = "fell_back"
+        if mu_d < mu_tol:
+            stop_reason = "mu_td_certain"
             tau2 = build_tau2(chain_tokens, chain_eefs, chain_qs, best.end_emb,
                               tau1, tau1_pts, cfg)
             D.append(tau2)
-            log(f"fell back: s* is {row['sstar_dist_tau1']:.4f} m from tau_1 state "
-                f"{tau2.join_idx}/{len(tau1.tokens)} (< eps={cfg.fallback_eps}) -> "
-                f"tau_2 = s_1 -> {rnd} s* ({len(tau2.tokens)} steps) added to D")
-            break
-        if cfg.stop_on_qgap and abs(gap) < cfg.converge_tol:
-            stop_reason = "q_gap"
-            log(f"Q-gap stop: |Q_TD - (Q_exp - mu_exp)| = {abs(gap):.4f} < "
-                f"{cfg.converge_tol} (s* not on tau_1, no tau_2)")
+            log(f"T_D certain at s*: mu_TD = {mu_d:.4f} < {mu_tol:.4f} -> tau_2 = s_1 -> "
+                f"{rnd} s* ({len(tau2.tokens)} steps) added to D; joins tau_1 at state "
+                f"{tau2.join_idx}/{len(tau1.tokens)}, {row['sstar_dist_tau1']:.3f} m away")
             break
         start_q, start_emb, start_hist, start_eef = best.qs[-1], best.end_emb, best.tokens, s_star
 
@@ -535,7 +569,7 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
             w.writerows(rows)
     summary = dict(
         stop_reason=stop_reason, fell_back=tau2 is not None, rounds=len(rows),
-        fallback_eps=cfg.fallback_eps, success_buffer_size=len(D),
+        mu_tol=mu_tol, success_buffer_size=len(D),
         tau1_len=len(tau1.tokens), s0=task.eef_start.tolist(), s1=s1_eef.tolist(),
         cube=task.cube_pos.tolist(), wall_sec=time.time() - t0, config=asdict(cfg),
         tau1_eefs=np.asarray(tau1.eefs).tolist(),
@@ -555,7 +589,7 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
     torch.save(T_D.state_dict(), os.path.join(outdir, "T_D.pt"))
     torch.save(T_exp.state_dict(), os.path.join(outdir, "T_explore.pt"))
     plot = (save_plots(outdir, tau1, s1_eef, rounds_trajs, s_stars, rows, task.cube_pos,
-                       chain_eefs, cfg.fallback_eps) if rows else None)
+                       chain_eefs, mu_tol, tau2 is not None) if rows else None)
     log(f"\nstop={stop_reason} rounds={len(rows)} tau_2={'yes' if tau2 else 'no'} | "
         f"|D|={len(D)} | {time.time() - t0:.0f}s total")
     log(f"outputs -> {outdir}/ (fallback.log, rounds.csv, summary.json, T_D.pt, T_explore.pt"
@@ -573,13 +607,15 @@ def parse_args():
     p.add_argument("--max-rounds", type=int, default=d.max_rounds)
     p.add_argument("--max-retries", type=int, default=d.max_retries)
     p.add_argument("--gamma", type=float, default=d.gamma)
-    p.add_argument("--fallback-eps", type=float, default=d.fallback_eps)
-    p.add_argument("--stop-on-qgap", action="store_true")
-    p.add_argument("--converge-tol", type=float, default=d.converge_tol)
+    p.add_argument("--mu-tol", type=float, default=None,
+                   help="stop when mu_TD(s*) < this (default: max mu_TD on tau_1)")
     p.add_argument("--td-epochs", type=int, default=d.td_epochs)
     p.add_argument("--explore-epochs", type=int, default=d.explore_epochs)
     p.add_argument("--mc-samples", type=int, default=d.mc_samples)
-    p.add_argument("--script-step", type=float, default=d.script_step)
+    p.add_argument("--script-step", type=float, default=d.script_step,
+                   help="demo (tau_1) step length, m")
+    p.add_argument("--action-step", type=float, default=d.action_step,
+                   help="exploration action bound, m (keep >= --script-step)")
     p.add_argument("--s1-min-dist", type=float, default=d.s1_min_dist)
     p.add_argument("--s1-max-dist", type=float, default=d.s1_max_dist)
     p.add_argument("--no-td-suffix-aug", action="store_true")
@@ -595,9 +631,8 @@ def parse_args():
 
     cfg = FallbackConfig(
         k=a.k, m=a.m, max_rounds=a.max_rounds, max_retries=a.max_retries, gamma=a.gamma,
-        fallback_eps=a.fallback_eps, stop_on_qgap=a.stop_on_qgap,
-        converge_tol=a.converge_tol, td_epochs=a.td_epochs, explore_epochs=a.explore_epochs,
-        mc_samples=a.mc_samples, script_step=a.script_step, s1_min_dist=a.s1_min_dist,
+        mu_tol=a.mu_tol, td_epochs=a.td_epochs, explore_epochs=a.explore_epochs,
+        mc_samples=a.mc_samples, script_step=a.script_step, action_step=a.action_step, s1_min_dist=a.s1_min_dist,
         s1_max_dist=a.s1_max_dist, td_suffix_aug=not a.no_td_suffix_aug,
         token_fusion=a.token_fusion, seed=a.seed, device=a.device)
     enc_cfg = EncoderConfig(model_name=a.encoder, device=a.encoder_device, n_calib=a.n_calib)
