@@ -139,8 +139,8 @@ class FallbackConfig:
     td_suffix_aug: bool = True
 
     # --- s_1 ---
-    s1_min_dist: float = 0.04
-    s1_max_dist: float = 0.08
+    s1_min_dist: float = 0.03            # s_1 lies 3-5 cm from s_0 (was 4-8 cm)
+    s1_max_dist: float = 0.05
 
     # --- exploration ---
     action_step: float = 0.01            # exploration action bound (m), = world step_size
@@ -609,6 +609,8 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
         tau1_len=len(tau1.tokens), s0=task.eef_start.tolist(), s1=s1_eef.tolist(),
         cube=task.cube_pos.tolist(), wall_sec=time.time() - t0, config=asdict(cfg),
         tau1_eefs=np.asarray(tau1.eefs).tolist(),
+        # T_D on its own demo; entry t is scored at token t, i.e. state t+1
+        tau1_q_td=[q for q, _ in q_fit], tau1_mu_td=mu_tau1.tolist(),
         s_stars=[s.tolist() for s in s_stars],
         state_scores=state_scores,
         tau2=None if tau2 is None else dict(

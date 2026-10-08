@@ -6,7 +6,10 @@ s_0 / s_1, every round's exploration paths, the s* of each round, tau_2 (if
 built), the cube with its eps_dist goal sphere, and the table top. Drag to
 rotate, scroll to zoom, right-drag (or the toolbar) to pan, click legend
 entries to hide/show, hover a point for its round / trajectory / step and
-distance to tau_1. Buttons switch between preset camera views.
+distance to tau_1, and -- for runs that saved them -- T_D's uncertainty mu_TD
+(certainty = -mu_TD), mu_explore and S' membership. Buttons switch between
+preset camera views and between colouring by round and colouring every
+state by mu_TD.
 
 Plotly.js is loaded from its CDN, so opening the page needs an internet
 connection; nothing beyond numpy is needed on the Python side.
@@ -75,10 +78,28 @@ def _sphere(center, r, n=18):
                 showlegend=True, hoverinfo="skip")
 
 
+MU_SCALE = [[0.0, "#2c7bb6"], [0.5, "#ffffbf"], [1.0, "#d7191c"]]   # low mu (certain) = blue
+
+
+def _score_text(sc) -> str:
+    if sc is None:
+        return ""
+    return (f"<br>μ_TD {sc['mu_td']:.4f} (certainty {-sc['mu_td']:.4f})"
+            f"<br>μ_explore {sc['mu_exp']:.4f} · {'in' if sc['in_S_prime'] else 'not in'} S′")
+
+
 def build_figure(d: dict):
+    """Returns (traces, round_idx, mu_idx): indices of the traces shown in
+    'colour by round' mode and in 'colour by mu_TD' mode (the rest are shown
+    in both)."""
     T = np.asarray(d["tau1_eefs"], float)
     cube = np.asarray(d["cube"], float)
-    traces = []
+    traces, round_idx, mu_idx = [], [], []
+    # per-round {(traj, step): scores}; step j >= 1 is the j-th new state
+    scores = [{(sc["traj"], sc["step"]): sc for sc in rnd} for rnd in d.get("state_scores", [])]
+    # tau_1 state j >= 1 is scored at token j - 1 (the step that led into it)
+    tau1_mu = d.get("tau1_mu_td")
+    mu_tol = d.get("mu_tol")
 
     # exploration, one legend entry per round (trajectories joined by None gaps)
     rounds = d.get("exploration", [])
@@ -92,18 +113,73 @@ def build_figure(d: dict):
             dd = _dist_to(P, T)
             for t, (p, di) in enumerate(zip(P, dd)):
                 xs.append(p[0]); ys.append(p[1]); zs.append(p[2])
+                sc = scores[r].get((j, t)) if r < len(scores) else None
                 hov.append(f"round {r + 1} · traj {j} · step {t}<br>"
-                           f"{100 * di:.1f} cm from τ₁")
+                           f"{100 * di:.1f} cm from τ₁" + _score_text(sc))
             xs.append(None); ys.append(None); zs.append(None); hov.append("")
         col = _viridis(r, len(rounds))
+        round_idx.append(len(traces))
         traces.append(dict(type="scatter3d", mode="lines+markers", name=f"round {r + 1}",
                            x=xs, y=ys, z=zs, text=hov, hovertemplate="%{text}<extra></extra>",
                            legendgroup=f"r{r}", connectgaps=False, opacity=0.75,
                            line=dict(color=col, width=2), marker=dict(color=col, size=2)))
 
     # tau_1
-    dT = [f"τ₁ step {i}" for i in range(len(T))]
+    dT = [f"τ₁ step {i}" + (f"<br>μ_TD {tau1_mu[i - 1]:.4f} (certainty {-tau1_mu[i - 1]:.4f})"
+                             if tau1_mu and i >= 1 else "") for i in range(len(T))]
     traces.append(_line(T, "τ₁ (demo)", "black", 7, dT, size=4))
+
+    # ---- 'colour by mu_TD' mode ----
+    pts, mus, syms, hovs = [], [], [], []
+    for r, trajs in enumerate(rounds):
+        for j, tr in enumerate(trajs):
+            P = np.asarray(tr, float)
+            for t in range(1, len(P)):
+                sc = scores[r].get((j, t)) if r < len(scores) else None
+                if sc is None:
+                    continue
+                pts.append(P[t]); mus.append(sc["mu_td"])
+                syms.append("circle" if sc["in_S_prime"] else "circle-open")
+                hovs.append(f"round {r + 1} · traj {j} · step {t}<br>"
+                            f"{100 * sc['dist_tau1']:.1f} cm from τ₁" + _score_text(sc))
+    all_mu = mus + (list(tau1_mu) if tau1_mu else [])
+    if all_mu:
+        cmin, cmax = (float(v) for v in np.percentile(all_mu, [2, 98]))
+        bar = dict(title=dict(text="μ_TD<br>(blue = certain)" +
+                              (f"<br>stop &lt; {mu_tol:.4f}" if mu_tol else ""), side="right"),
+                   len=0.6, thickness=14, x=1.0)
+        if pts:
+            # grey paths underneath, so the coloured states keep their context
+            xs, ys, zs = [], [], []
+            for trajs in rounds:
+                for tr in trajs:
+                    for p in tr:
+                        xs.append(p[0]); ys.append(p[1]); zs.append(p[2])
+                    xs.append(None); ys.append(None); zs.append(None)
+            mu_idx.append(len(traces))
+            traces.append(dict(type="scatter3d", mode="lines", name="exploration paths",
+                               x=xs, y=ys, z=zs, hoverinfo="skip", visible=False,
+                               line=dict(color="rgba(120,120,120,0.45)", width=1.5)))
+            P = np.asarray(pts)
+            mu_idx.append(len(traces))
+            traces.append(dict(type="scatter3d", mode="markers",
+                               name="explored states: μ_TD (filled = in S′)",
+                               x=P[:, 0].tolist(), y=P[:, 1].tolist(), z=P[:, 2].tolist(),
+                               text=hovs, hovertemplate="%{text}<extra></extra>", visible=False,
+                               marker=dict(size=3.5, color=mus, symbol=syms, colorscale=MU_SCALE,
+                                           cmin=cmin, cmax=cmax, colorbar=bar,
+                                           showscale=True)))
+        if tau1_mu:
+            mu_idx.append(len(traces))
+            traces.append(dict(type="scatter3d", mode="markers", name="τ₁ states: μ_TD",
+                               x=T[1:, 0].tolist(), y=T[1:, 1].tolist(), z=T[1:, 2].tolist(),
+                               text=[f"τ₁ step {i}<br>μ_TD {m:.4f} (certainty {-m:.4f})"
+                                     for i, m in enumerate(tau1_mu, start=1)],
+                               hovertemplate="%{text}<extra></extra>", visible=False,
+                               marker=dict(size=6, symbol="square", color=list(tau1_mu),
+                                           colorscale=MU_SCALE, cmin=cmin, cmax=cmax,
+                                           showscale=not pts, colorbar=bar,
+                                           line=dict(color="black", width=1))))
 
     # tau_2
     tau2 = d.get("tau2")
@@ -121,8 +197,14 @@ def build_figure(d: dict):
     # s* per round
     for r, s in enumerate(s_stars):
         di = _dist_to(s[None], T)[0]
+        sc = None
+        if r < len(scores) and r < len(rounds):
+            for (j, t), v in scores[r].items():
+                if np.allclose(rounds[r][j][t], s, atol=1e-9):
+                    sc = v
+                    break
         tr = _point(s, f"s* round {r + 1}", "orange", "diamond", 6,
-                    f"s* round {r + 1}<br>{100 * di:.1f} cm from τ₁")
+                    f"s* round {r + 1}<br>{100 * di:.1f} cm from τ₁" + _score_text(sc))
         tr["legendgroup"] = "sstar"
         tr["showlegend"] = r == 0
         if r == 0:
@@ -147,7 +229,7 @@ def build_figure(d: dict):
                        z=[[TABLE_Z, TABLE_Z], [TABLE_Z, TABLE_Z]], opacity=0.25,
                        showscale=False, colorscale=[[0, "#8b6b4a"], [1, "#8b6b4a"]],
                        name="table top", showlegend=True, hoverinfo="skip"))
-    return traces
+    return traces, round_idx, mu_idx
 
 
 def _box(P: np.ndarray, pad: float):
@@ -163,7 +245,7 @@ def write_html(run_dir: str, summary: dict = None) -> str:
     if summary is None:
         with open(os.path.join(run_dir, "summary.json")) as f:
             summary = json.load(f)
-    traces = build_figure(summary)
+    traces, round_idx, mu_idx = build_figure(summary)
     # close-up box: exploration, s_1, s* and tau_2 (tau_1 / table / cube are
     # still drawn, just clipped to this box)
     pts = [np.asarray(summary["s1"], float)[None]]
@@ -216,6 +298,9 @@ def write_html(run_dir: str, summary: dict = None) -> str:
   <span style="margin-left:10px">Zoom:</span>
   <button id="close">Exploration close-up</button>
   <button id="full">Full scene</button>
+  <span class="colour" style="margin-left:10px">Colour:</span>
+  <button class="colour" id="by-round">By round</button>
+  <button class="colour" id="by-mu">By T_D uncertainty (μ_TD)</button>
 </div>
 <div id="plot"></div>
 <script>
@@ -243,6 +328,14 @@ document.getElementById("close").onclick = () => Plotly.relayout("plot", {{
   "scene.aspectratio": {{x: close.ratio[0], y: close.ratio[1], z: close.ratio[2]}},
   "scene.xaxis.range": close.range[0], "scene.yaxis.range": close.range[1],
   "scene.zaxis.range": close.range[2]}});
+const roundIdx = {json.dumps(round_idx)}, muIdx = {json.dumps(mu_idx)};
+if (!muIdx.length) document.querySelectorAll(".colour").forEach(e => e.style.display = "none");
+const colourMode = mu => {{
+  Plotly.restyle("plot", {{visible: !mu}}, roundIdx);
+  Plotly.restyle("plot", {{visible: mu}}, muIdx);
+}};
+document.getElementById("by-round").onclick = () => colourMode(false);
+document.getElementById("by-mu").onclick = () => colourMode(true);
 document.getElementById("full").onclick = () => Plotly.relayout("plot", {{
   "scene.aspectmode": "data", "scene.xaxis.autorange": true,
   "scene.yaxis.autorange": true, "scene.zaxis.autorange": true}});

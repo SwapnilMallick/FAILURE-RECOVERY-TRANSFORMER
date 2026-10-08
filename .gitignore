@@ -16,6 +16,8 @@ fallback_results/
 fallback_results_2/
 fallback_results_3/
 fallback_results_4/
+fallback_results_5/
+
 *_results/
 *.pt
 *.pth
