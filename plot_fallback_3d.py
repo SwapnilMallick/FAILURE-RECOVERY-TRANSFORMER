@@ -78,6 +78,34 @@ def _sphere(center, r, n=18):
                 showlegend=True, hoverinfo="skip")
 
 
+PATH_COLOR = "#d61fd6"    # fallback path / tau_2: magenta, unlike every other trace
+
+
+def fallback_path(d: dict):
+    """(N, 3) EEF positions of s_1 -> s*_1 -> ... -> last s*. Read from
+    summary['chain_eefs'] (newer runs) or tau_2, else rebuilt from the saved
+    exploration: each round's s* is a state of one of that round's
+    trajectories, and the path follows that trajectory from the round's start
+    up to s*."""
+    if d.get("chain_eefs"):
+        return np.asarray(d["chain_eefs"], float)
+    if d.get("tau2"):
+        return np.asarray(d["tau2"]["eefs"], float)
+    rounds, s_stars = d.get("exploration", []), d.get("s_stars", [])
+    if not s_stars:
+        return None
+    path = [np.asarray(d["s1"], float)]
+    for trajs, s in zip(rounds, s_stars):
+        s = np.asarray(s, float)
+        hit = next(((P, k) for P in (np.asarray(t, float) for t in trajs if len(t) > 1)
+                    for k in range(1, len(P)) if np.allclose(P[k], s, atol=1e-9)), None)
+        if hit is None:
+            return None                       # cannot rebuild reliably
+        P, k = hit
+        path.extend(P[1:k + 1])
+    return np.asarray(path)
+
+
 MU_SCALE = [[0.0, "#2c7bb6"], [0.5, "#ffffbf"], [1.0, "#d7191c"]]   # low mu (certain) = blue
 
 
@@ -181,17 +209,20 @@ def build_figure(d: dict):
                                            showscale=not pts, colorbar=bar,
                                            line=dict(color="black", width=1))))
 
-    # tau_2
+    # fallback path s_1 -> s*_1 -> ... -> last s* (= tau_2 once it is built),
+    # drawn whether or not the run finished
     tau2 = d.get("tau2")
-    if tau2:
-        P2 = np.asarray(tau2["eefs"], float)
-        d2 = _dist_to(P2, T)
-        hov = [f"τ₂ step {i}<br>{100 * di:.1f} cm from τ₁" for i, di in enumerate(d2)]
-        traces.append(_line(P2, f"τ₂ ({len(P2) - 1} steps)", "crimson", 8, hov, size=4))
-        j = tau2.get("join_idx", -1)
+    chain = fallback_path(d)
+    if chain is not None and len(chain) > 1:
+        dc = _dist_to(chain, T)
+        name = (f"fallback path = τ₂ ({len(chain) - 1} steps)" if tau2 else
+                f"fallback path ({len(chain) - 1} steps, unfinished: no τ₂)")
+        hov = [f"fallback path step {i}<br>{100 * di:.1f} cm from τ₁" for i, di in enumerate(dc)]
+        traces.append(_line(chain, name, PATH_COLOR, 9, hov, size=4))
+        j = tau2.get("join_idx", -1) if tau2 else -1
         if 0 <= j < len(T):
-            traces.append(_line(np.stack([P2[-1], T[j]]), f"τ₂ end → τ₁ state {j}",
-                                "crimson", 3, ["τ₂ end", f"τ₁ state {j}"], mode="lines",
+            traces.append(_line(np.stack([chain[-1], T[j]]), f"τ₂ end → τ₁ state {j}",
+                                PATH_COLOR, 3, ["τ₂ end", f"τ₁ state {j}"], mode="lines",
                                 dash="dash"))
 
     # s* per round

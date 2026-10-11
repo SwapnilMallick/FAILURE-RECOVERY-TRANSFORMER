@@ -1,11 +1,30 @@
 """
-Falling back to a successful trajectory tau_1 with two Q-transformers
-(robosuite Lift/Panda cube-reaching testbed, image-state tokens).
+Falling back to a successful trajectory tau_1 with a Q-model T_D trained on
+tau_1 and a Q-transformer T_explore (robosuite Lift/Panda cube-reaching
+testbed, image-state tokens).
+
+T_D (--td-model)
+----------------
+  * "dnn" (default): an ensemble of n_dnn (5) small feed-forward Q-networks
+    (dnn_ensemble.py), Q(s, a) from the current state's image embedding and
+    the action, no history. mu_TD of a STATE s is
+        U(s) = max_i Q^i(s, a) - min_i Q^i(s, a),
+    averaged over n_probe_actions random exploration-style actions, scored
+    from s's own image. Everywhere below, "mu_TD" means this U: a candidate
+    action's mu_TD is U of the state it leads to (rendered once per
+    candidate), and T_explore's label for a step is -U of the state it leads
+    into. Chosen after the band probes (probe_*.py): an ensemble's spread grew
+    with distance from tau_1 where MC dropout's did not, and only when tau_1's
+    actions vary -- hence the varied demo is the default too.
+  * "transformer": the original single ImageCostTransformer with MC-dropout
+    std as mu_TD, scored at (history, action) tokens. With --demo straight
+    this reproduces the earlier runs.
 
 Method (single fall-back iteration)
 -----------------------------------
-    T_D, T_explore <- two freshly initialised Q-transformers
-    D              <- { tau_1 }        (tau_1 from a scripted reaching policy)
+    T_D, T_explore <- freshly initialised (T_D: DNN ensemble or transformer)
+    D              <- { tau_1 }        (tau_1 from a scripted reaching policy,
+                                        varied or straight, see --demo)
     train T_D on tau_1
     s_0 <- initial state of tau_1 ;  s_1 <- a nearby perturbed start state
     start <- s_1 (empty history)
@@ -18,8 +37,9 @@ Method (single fall-back iteration)
         train T_explore on the exploration buffer (all rounds so far); its
             label for every (h_t, a_t) is T_D's certainty there, -mu_TD(h_t, a_t)
         S  = every state visited this round (up to k*m, start state excluded)
-        S' = the top keep_frac (50%) of S by mu_exp; i.e. alpha is set each
-             round to the cutoff value of mu_exp that keeps that fraction
+        S' = the top keep_frac of S by mu_exp; i.e. alpha is set each round
+             to the cutoff value of mu_exp that keeps that fraction
+             (keep_frac = 1.0 for the DNN T_D, so S' = S; 0.5 for the transformer)
         s* = argmax_{s in S'}  -mu_TD(s)     (the state T_D is most certain about)
         chain  <- chain + the trajectory that reached s*, cut at s*
         stop   if  mu_TD(s*) ~ 0, i.e. mu_TD(s*) < mu_tol  (T_D is certain at s*:
@@ -60,6 +80,16 @@ Interpretation choices (the method text leaves these open)
     eventually leaves S' empty. Keeping the top keep_frac of each round's
     states by mu_exp means "more uncertain to T_explore than the rest of this
     round", and S' is never empty while S is not.
+  * Fixed step length (fixed_step; default on for the DNN T_D): every
+    exploration action, every varied-demo step and every random action the
+    DNN uncertainty is averaged over is exactly action_step (1 cm) long, only
+    its direction random -- so tau_1 and exploration use the same step size
+    (with the straight demo's 1 cm steps too). Off, lengths are uniform in
+    the action_step ball (mean 0.75 cm), as in the transformer runs.
+  * DNN T_D: s* is chosen by U over ALL visited states (keep_frac = 1.0). In
+    the first DNN runs the mu_exp filter removed the state closest to tau_1
+    in 4-5 of 10 rounds -- once the single lowest-U state of the round --
+    before U was looked at.
   * s* in the middle of a trajectory. tau_2 and the next round's history are
     that trajectory cut at s*; the rest of it is dropped. Every visited
     state's embedding is kept (Traj.embs) so the next round can start there.
@@ -98,13 +128,14 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 
 from image_encoder import EncoderConfig, ImageEncoder
-from plot_fallback_3d import write_html
+from dnn_ensemble import DNNEnsemble, train_dnn_ensemble
+from plot_fallback_3d import PATH_COLOR, write_html
 from online_cost_transformer import (
     ImageCostTransformer, causal_mask, collate, fuse, huber_loss, predict_last_mc,
 )
@@ -132,7 +163,18 @@ class FallbackConfig:
     # --- Q-values ---
     gamma: float = 0.97
 
+    # --- T_D: "dnn" = ensemble of feed-forward Q-nets (dnn_ensemble.py),
+    #     "transformer" = the single MC-dropout ImageCostTransformer ---
+    td_model: str = "dnn"
+    n_dnn: int = 5                       # ensemble members
+    dnn_hidden: int = 256
+    dnn_epochs: int = 400
+    dnn_lr: float = 1e-3
+    n_probe_actions: int = 3             # random actions U(s) is averaged over
+
     # --- tau_1 (scripted policy) + T_D ---
+    demo: str = "varied"                 # "varied" (actions vary) | "straight"
+    demo_noise: float = 1.0              # varied demo: direction-noise std
     script_step: float = 0.01            # m per scripted step (<= action_step)
     script_max_steps: int = 60
     td_epochs: int = 400
@@ -144,12 +186,16 @@ class FallbackConfig:
 
     # --- exploration ---
     action_step: float = 0.01            # exploration action bound (m), = world step_size
+    fixed_step: Optional[bool] = None    # every exploration / varied-demo / DNN-probe action
+                                         # exactly action_step long (random direction only);
+                                         # None = True for dnn, False for transformer
     k: int = 8                           # trajectories per round
     m: int = 10                          # steps per trajectory
     max_retries: int = 10                # action resamples per step
     explore_epochs: int = 60             # T_explore epochs per round
     max_rounds: int = 10
-    keep_frac: float = 0.5               # S' = top keep_frac of visited states by mu_exp
+    keep_frac: Optional[float] = None    # S' = top keep_frac of visited states by mu_exp;
+                                         # None = 1.0 (all) for dnn, 0.5 for transformer
     mu_tol: Optional[float] = None       # stop when mu_TD(s*) < mu_tol;
                                          # None = mean mu_TD over tau_1
 
@@ -173,6 +219,8 @@ class Traj:
     n_sample_fail: int = 0
     stuck: bool = False                  # a step found no accepted action
     join_idx: int = -1                   # tau_2 only: index of the tau_1 state it joins
+    # DNN T_D only: (Q, U) of the state each token leads into, parallel to tokens
+    tok_qu: List[Tuple[float, float]] = field(default_factory=list)
 
     @property
     def n_new(self) -> int:
@@ -217,6 +265,72 @@ def collect_scripted_trajectory(task: RobosuiteTask, encoder: ImageEncoder,
     T = len(tokens)
     labels = cfg.gamma ** (T - 1 - np.arange(T, dtype=float))
     return Traj(tokens, eefs, qs, emb, reached=True, labels=labels)
+
+
+def make_varied_demo(noise: float, seed: int, log, tries_per_step: int = 30,
+                     max_demos: int = 20):
+    """Returns demo_fn(task, encoder, cfg) -> Traj: a scripted reach whose
+    actions vary step to step. Every step aims at the cube plus Gaussian
+    direction noise (std `noise`, relative to the unit cube direction) and its
+    length is drawn like an exploration action (uniform in the action_step
+    ball); each step is IK-, workspace- and collision-checked. The demo must
+    reach the cube within cfg.script_max_steps, else it restarts with fresh
+    noise (up to max_demos times). Uses its own RNG stream (seed + 6_000_003)
+    so it never shifts exploration's."""
+    rng = np.random.default_rng(seed + 6_000_003)
+
+    def demo(task, encoder, cfg):
+        ik, world = task.ik, task.world
+        for attempt in range(1, max_demos + 1):
+            task.reset_to_start()
+            q, eef = ik.get_q(), ik.eef_pos()
+            emb = encoder.embed(ik)
+            tokens, eefs, qs = [], [eef], [q]
+            for _ in range(cfg.script_max_steps):
+                if task.reached(eef):
+                    break
+                g = task.cube_pos - eef
+                g /= np.linalg.norm(g)
+                for _try in range(tries_per_step):
+                    dirv = g + noise * rng.normal(size=3)
+                    dirv /= np.linalg.norm(dirv)
+                    a_ = dirv * (cfg.action_step if cfg.fixed_step
+                                 else cfg.action_step * rng.random() ** (1 / 3))
+                    if not world._in_bounds(eef + a_):
+                        continue
+                    q_to, ok = ik.solve_ik(eef + a_, q_init=q)
+                    if ok and not world.collides(q, q_to):
+                        break
+                    ik.set_q(q)
+                else:
+                    break                               # stuck: restart the demo
+                ik.set_q(q_to)
+                tokens.append(fuse(emb.reshape(-1), a_))
+                q, eef = q_to, ik.eef_pos()
+                emb = encoder.embed(ik)
+                eefs.append(eef)
+                qs.append(q)
+            if task.reached(eef):
+                A = np.array([t[-3:] for t in tokens])
+                U = A / np.linalg.norm(A, axis=1, keepdims=True)
+                to_goal = np.array([task.cube_pos - e for e in eefs[:-1]])
+                to_goal /= np.linalg.norm(to_goal, axis=1, keepdims=True)
+                ang = np.degrees(np.arccos(np.clip((U * to_goal).sum(1), -1, 1)))
+                cos = U @ U.T
+                log(f"varied demo (noise {noise}, attempt {attempt}): {len(tokens)} steps | "
+                    f"step length {100 * np.linalg.norm(A, axis=1).mean():.2f} cm mean "
+                    f"({100 * np.linalg.norm(A, axis=1).min():.2f}-"
+                    f"{100 * np.linalg.norm(A, axis=1).max():.2f}) | angle off the cube "
+                    f"direction {ang.mean():.0f} deg mean, {ang.max():.0f} max | mean "
+                    f"pairwise cosine between actions {cos[np.triu_indices(len(U), 1)].mean():.2f} "
+                    f"(straight demo: 1.00)")
+                T = len(tokens)
+                return Traj(tokens, eefs, qs, emb, reached=True,
+                            labels=cfg.gamma ** (T - 1 - np.arange(T, dtype=float)))
+        raise RuntimeError(f"varied demo did not reach the cube in {max_demos} attempts; "
+                           f"lower --demo-noise")
+
+    return demo
 
 
 # --------------------------------------------------------------------------- #
@@ -305,18 +419,24 @@ def explore_sequences(buffer: List[Traj], cfg: FallbackConfig):
 # --------------------------------------------------------------------------- #
 def collect_exploration_trajectory(T_D, T_exp, task: RobosuiteTask, encoder: ImageEncoder,
                                    cfg: FallbackConfig, rng, start_q, start_emb,
-                                   hist_tokens: List[np.ndarray]) -> Traj:
+                                   hist_tokens: List[np.ndarray], dnn=None,
+                                   hist_qu: Optional[List[Tuple[float, float]]] = None) -> Traj:
     """One m-step trajectory from start_q. Candidate actions come from
     world.sample_free (uniform in the step ball, IK-reachable, collision-free);
     a candidate is taken iff -mu_TD > Q_exp - mu_exp. Labels for T_explore
-    are -mu_TD at every position."""
+    are -mu_TD at every position.
+
+    With a DNN ensemble (`dnn`), mu_TD of a candidate is U(s') of the state it
+    leads to, scored from s''s own image (rendered right after sample_free,
+    which leaves the sim there); each token's (Q, U) is kept in tok_qu, the
+    history's coming in as `hist_qu`."""
     ik, world = task.ik, task.world
     task.reset_to_start()
     ik.set_q(start_q)
     q_cur, emb = np.asarray(start_q, float).copy(), start_emb
     tokens = list(hist_tokens)
     tr = Traj(tokens, [ik.eef_pos()], [q_cur.copy()], emb, embs=[emb],
-              hist_len=len(hist_tokens))
+              hist_len=len(hist_tokens), tok_qu=list(hist_qu or []))
 
     for _ in range(cfg.m):
         accepted = None
@@ -327,10 +447,15 @@ def collect_exploration_trajectory(T_D, T_exp, task: RobosuiteTask, encoder: Ima
                 continue
             a, _s_next, q_to = cand
             tok = fuse(emb.reshape(-1), a)
-            _, mu_d = predict_last_mc(T_D, tokens + [tok], cfg)
+            if dnn is not None:
+                emb_next = encoder.embed(ik)          # sim is at q_to (sample_free)
+                q_d, mu_d = dnn.state_u(emb_next)
+            else:
+                emb_next, q_d = None, None
+                _, mu_d = predict_last_mc(T_D, tokens + [tok], cfg)
             q_e, mu_e = predict_last_mc(T_exp, tokens + [tok], cfg)
             if -mu_d > q_e - mu_e:
-                accepted = (tok, q_to)
+                accepted = (tok, q_to, emb_next, (q_d, mu_d))
                 break
             tr.n_reject += 1
             ik.set_q(q_cur)                  # undo the rejected candidate's move
@@ -338,10 +463,13 @@ def collect_exploration_trajectory(T_D, T_exp, task: RobosuiteTask, encoder: Ima
             tr.stuck = True
             ik.set_q(q_cur)
             break
-        tok, q_cur = accepted
+        tok, q_cur, emb_next, qu = accepted
         ik.set_q(q_cur)
         tokens.append(tok)
-        emb = encoder.embed(ik)
+        # same configuration, so the candidate's render is reused when we have it
+        emb = emb_next if emb_next is not None else encoder.embed(ik)
+        if dnn is not None:
+            tr.tok_qu.append(qu)
         tr.eefs.append(ik.eef_pos())
         tr.embs.append(emb)
         tr.qs.append(q_cur.copy())
@@ -354,8 +482,11 @@ def collect_exploration_trajectory(T_D, T_exp, task: RobosuiteTask, encoder: Ima
         # the caller trims history to max_len - m, so the whole sequence fits
         # in one window and every token gets a label
         assert len(tokens) <= cfg.max_len
-        _, mu_all = mc_all(T_D, tokens, cfg)
-        tr.labels = -mu_all.astype(float)
+        if dnn is not None:
+            tr.labels = -np.array([u for _, u in tr.tok_qu], float)
+        else:
+            _, mu_all = mc_all(T_D, tokens, cfg)
+            tr.labels = -mu_all.astype(float)
     return tr
 
 
@@ -410,8 +541,8 @@ def save_plots(outdir, tau1: Traj, s1_eef, rounds_trajs, s_stars, cube,
         ax.scatter(S[:, 0], S[:, 1], S[:, 2], color="tab:orange", marker="*", s=120,
                    label=r"$s^*$ per round")
     C = np.asarray(chain_eefs)
-    ax.plot(C[:, 0], C[:, 1], C[:, 2], color="tab:red", lw=2.2,
-            label=r"chain $s_1 \to s^*$" + (r" ($\tau_2$)" if made_tau2 else ""))
+    ax.plot(C[:, 0], C[:, 1], C[:, 2], color=PATH_COLOR, lw=2.6,
+            label=r"fallback path $s_1 \to s^*$" + (r" ($\tau_2$)" if made_tau2 else " (unfinished)"))
     ax.scatter(*cube, color="tab:red", s=80, label="cube")
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
     ax.legend(fontsize=7, loc="upper left")
@@ -428,6 +559,10 @@ def save_plots(outdir, tau1: Traj, s1_eef, rounds_trajs, s_stars, cube,
 # Driver
 # --------------------------------------------------------------------------- #
 def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
+    if cfg.keep_frac is None:
+        cfg.keep_frac = 1.0 if cfg.td_model == "dnn" else 0.5
+    if cfg.fixed_step is None:
+        cfg.fixed_step = cfg.td_model == "dnn"
     os.makedirs(outdir, exist_ok=True)
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
@@ -451,13 +586,19 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
         encoder.calibrate(task, calib_rng)
     finally:
         task.world.cfg.step_size = cfg.action_step
+    task.world.cfg.fixed_step = bool(cfg.fixed_step)     # after calibration (random-length walk)
     encoder.save_stats(os.path.join(outdir, "encoder_stats.npz"))
     log(f"task: eef_start={task.eef_start.round(3)} cube={task.cube_pos.round(3)} "
         f"eps={task.cfg.eps_dist} | encoder {enc_cfg.model_name} x {list(enc_cfg.cameras)} "
         f"on {encoder.device}, calibrated on {enc_cfg.n_calib} states")
     log(f"config: {json.dumps(asdict(cfg))}")
-    log(f"step sizes: demo {cfg.script_step} m/step, exploration actions <= "
-        f"{task.world.cfg.step_size} m, gamma {cfg.gamma}")
+    if cfg.fixed_step:
+        log(f"step sizes: every action exactly {cfg.action_step} m (exploration, "
+            f"{'varied demo' if cfg.demo == 'varied' else f'straight demo {cfg.script_step} m/step'}"
+            f"{', DNN probe actions' if cfg.td_model == 'dnn' else ''}), gamma {cfg.gamma}")
+    else:
+        log(f"step sizes: demo {cfg.script_step} m/step, exploration actions <= "
+            f"{task.world.cfg.step_size} m, gamma {cfg.gamma}")
 
     def new_model():
         return ImageCostTransformer(
@@ -471,21 +612,44 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
     T_exp = new_model()
 
     # ---- tau_1 and T_D ----
-    tau1 = collect_scripted_trajectory(task, encoder, cfg)
+    demo_fn = make_varied_demo(cfg.demo_noise, cfg.seed, log) if cfg.demo == "varied" else None
+    tau1 = (demo_fn or collect_scripted_trajectory)(task, encoder, cfg)
     D = [tau1]
     tau1_pts = np.asarray(tau1.eefs)
-    log(f"\ntau_1: {len(tau1.tokens)} steps, start {tau1.eefs[0].round(3)} -> "
+    log(f"\ntau_1 ({cfg.demo} demo): {len(tau1.tokens)} steps, start {tau1.eefs[0].round(3)} -> "
         f"end {tau1.eefs[-1].round(3)} (dist to cube {task.dist_to_cube(tau1.eefs[-1]):.3f})")
-    loss_d = train_q(T_D, td_sequences(tau1, cfg), cfg.td_epochs, cfg, train_rng)
-    q_fit = [predict_last_mc(T_D, tau1.tokens[:t + 1], cfg) for t in range(len(tau1.tokens))]
-    log(f"T_D trained ({cfg.td_epochs} epochs, final loss {loss_d:.2e}); "
-        f"fit on tau_1 (label / Q_TD +- mu):")
-    log("   " + "  ".join(f"{l:.3f}/{q:.3f}+-{s:.3f}" for l, (q, s) in zip(tau1.labels, q_fit)))
-    mu_tau1 = np.array([sd for _, sd in q_fit])
-    mu_tol = cfg.mu_tol if cfg.mu_tol is not None else float(mu_tau1.mean())
+    dnn = None
+    if cfg.td_model == "dnn":
+        log(f"T_D = ensemble of {cfg.n_dnn} feed-forward Q-nets (no history); mu_TD of a "
+            f"state = U = max - min of their Q, mean over {cfg.n_probe_actions} random actions")
+        models = train_dnn_ensemble(
+            np.stack([tok[:-3] for tok in tau1.tokens]), np.stack([tok[-3:] for tok in tau1.tokens]),
+            tau1.labels, cfg.n_dnn, cfg.dnn_hidden, cfg.dnn_epochs, cfg.dnn_lr, cfg.seed,
+            cfg.action_step, log)
+        dnn = DNNEnsemble(models, cfg.action_step, cfg.n_probe_actions,
+                          np.random.default_rng(cfg.seed + 8_000_003),
+                          fixed_len=bool(cfg.fixed_step))
+        # every tau_1 state (s_0 .. s_T) scored exactly like an explored state
+        qu_tau1 = [dnn.state_u(e) for e in
+                   [tok[:-3] for tok in tau1.tokens] + [tau1.end_emb.reshape(-1)]]
+        mu_all_states = np.array([u for _, u in qu_tau1])
+        # stored per token t (= state t+1), the convention plot_fallback_3d reads
+        tau1_q_td = [q for q, _ in qu_tau1[1:]]
+        mu_tau1 = mu_all_states[1:]
+        mu_ref = mu_all_states
+    else:
+        loss_d = train_q(T_D, td_sequences(tau1, cfg), cfg.td_epochs, cfg, train_rng)
+        q_fit = [predict_last_mc(T_D, tau1.tokens[:t + 1], cfg) for t in range(len(tau1.tokens))]
+        log(f"T_D trained ({cfg.td_epochs} epochs, final loss {loss_d:.2e}); "
+            f"fit on tau_1 (label / Q_TD +- mu):")
+        log("   " + "  ".join(f"{l:.3f}/{q:.3f}+-{s:.3f}" for l, (q, s) in zip(tau1.labels, q_fit)))
+        tau1_q_td = [q for q, _ in q_fit]
+        mu_tau1 = np.array([sd for _, sd in q_fit])
+        mu_ref = mu_tau1
+    mu_tol = cfg.mu_tol if cfg.mu_tol is not None else float(mu_ref.mean())
     log(f"stop when mu_TD(s*) < mu_tol = {mu_tol:.4f}"
         f"{'' if cfg.mu_tol is not None else '  (mean mu_TD over tau_1)'}  | mu_TD on "
-        f"tau_1: min {mu_tau1.min():.4f} mean {mu_tau1.mean():.4f} max {mu_tau1.max():.4f}")
+        f"tau_1: min {mu_ref.min():.4f} mean {mu_ref.mean():.4f} max {mu_ref.max():.4f}")
 
     # ---- s_1 ----
     q1, s1_eef = sample_nearby_start(task, cfg, rng)
@@ -494,6 +658,7 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
         f"dist to tau_1 = {min_dist_to([s1_eef], tau1_pts):.3f} m)")
 
     start_q, start_emb, start_hist, start_eef = q1, emb1, [], s1_eef
+    start_hist_qu: List[Tuple[float, float]] = []
     # the full, untruncated s_1 -> s*_1 -> s*_2 -> ... chain (becomes tau_2)
     chain_tokens: List[np.ndarray] = []
     chain_eefs: List[np.ndarray] = [s1_eef]
@@ -511,9 +676,11 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
     for rnd in range(1, cfg.max_rounds + 1):
         t_r = time.time()
         # max_len keeps the positional table valid: inherited history + m new steps
-        hist = start_hist[-(cfg.max_len - cfg.m):] if cfg.max_len > cfg.m else []
+        keep_n = cfg.max_len - cfg.m
+        hist = start_hist[-keep_n:] if keep_n > 0 else []
+        hist_qu = start_hist_qu[-keep_n:] if keep_n > 0 else []
         trajs = [collect_exploration_trajectory(T_D, T_exp, task, encoder, cfg, rng,
-                                                start_q, start_emb, hist)
+                                                start_q, start_emb, hist, dnn, hist_qu)
                  for _ in range(cfg.k)]
         explore_buffer.extend(trajs)
         loss_e = train_q(T_exp, explore_sequences(explore_buffer, cfg),
@@ -526,7 +693,11 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
         for t in trajs:
             if t.n_new == 0:
                 continue
-            q_td_all, mu_td_all = mc_all(T_D, t.tokens, cfg)
+            if dnn is not None:                 # U(s_j) was scored when s_j was reached
+                q_td_all = [q for q, _ in t.tok_qu]
+                mu_td_all = [u for _, u in t.tok_qu]
+            else:
+                q_td_all, mu_td_all = mc_all(T_D, t.tokens, cfg)
             q_e_all, mu_e_all = mc_all(T_exp, t.tokens, cfg)
             for j in range(1, t.n_new + 1):
                 p = t.hist_len + j - 1
@@ -596,6 +767,7 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
             break
         start_q, start_emb = best.qs[j_star], best.embs[j_star]
         start_hist, start_eef = best.tokens[:cut], s_star
+        start_hist_qu = best.tok_qu[:cut]
 
     # ---- outputs ----
     with open(os.path.join(outdir, "rounds.csv"), "w", newline="") as f:
@@ -610,8 +782,9 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
         cube=task.cube_pos.tolist(), wall_sec=time.time() - t0, config=asdict(cfg),
         tau1_eefs=np.asarray(tau1.eefs).tolist(),
         # T_D on its own demo; entry t is scored at token t, i.e. state t+1
-        tau1_q_td=[q for q, _ in q_fit], tau1_mu_td=mu_tau1.tolist(),
+        tau1_q_td=list(tau1_q_td), tau1_mu_td=mu_tau1.tolist(),
         s_stars=[s.tolist() for s in s_stars],
+        chain_eefs=np.asarray(chain_eefs).tolist(),     # fallback path s_1 -> ... -> last s*
         state_scores=state_scores,
         tau2=None if tau2 is None else dict(
             eefs=np.asarray(tau2.eefs).tolist(), qs=np.asarray(tau2.qs).tolist(),
@@ -625,14 +798,18 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
         np.savez(os.path.join(outdir, "tau2.npz"), tokens=np.asarray(tau2.tokens),
                  labels=tau2.labels, eefs=np.asarray(tau2.eefs), qs=np.asarray(tau2.qs),
                  join_idx=tau2.join_idx)
-    torch.save(T_D.state_dict(), os.path.join(outdir, "T_D.pt"))
+    if dnn is not None:
+        torch.save(dnn.state_dicts(), os.path.join(outdir, "T_D_dnn.pt"))
+    else:
+        torch.save(T_D.state_dict(), os.path.join(outdir, "T_D.pt"))
     torch.save(T_exp.state_dict(), os.path.join(outdir, "T_explore.pt"))
     plot = (save_plots(outdir, tau1, s1_eef, rounds_trajs, s_stars, task.cube_pos,
                        chain_eefs, tau2 is not None) if rows else None)
     log(f"\nstop={stop_reason} rounds={len(rows)} tau_2={'yes' if tau2 else 'no'} | "
         f"|D|={len(D)} | {time.time() - t0:.0f}s total")
     html = write_html(outdir, summary) if rows else None
-    log(f"outputs -> {outdir}/ (fallback.log, rounds.csv, summary.json, T_D.pt, T_explore.pt"
+    log(f"outputs -> {outdir}/ (fallback.log, rounds.csv, summary.json, "
+        f"{'T_D_dnn.pt' if dnn is not None else 'T_D.pt'}, T_explore.pt"
         f"{', tau2.npz' if tau2 else ''}{', ' + os.path.basename(plot) if plot else ''}"
         f"{', ' + os.path.basename(html) if html else ''})")
     task.close()
@@ -648,17 +825,33 @@ def parse_args():
     p.add_argument("--max-rounds", type=int, default=d.max_rounds)
     p.add_argument("--max-retries", type=int, default=d.max_retries)
     p.add_argument("--gamma", type=float, default=d.gamma)
-    p.add_argument("--keep-frac", type=float, default=d.keep_frac,
-                   help="S' = top fraction of this round's visited states by mu_explore")
+    p.add_argument("--keep-frac", type=float, default=None,
+                   help="S' = top fraction of this round's visited states by mu_explore; "
+                        "default 1.0 (all states) with --td-model dnn, 0.5 with transformer")
     p.add_argument("--mu-tol", type=float, default=None,
                    help="stop when mu_TD(s*) < this (default: mean mu_TD over tau_1)")
-    p.add_argument("--td-epochs", type=int, default=d.td_epochs)
+    p.add_argument("--td-model", choices=["dnn", "transformer"], default=d.td_model,
+                   help="T_D: ensemble of feed-forward Q-nets (default) or the single "
+                        "MC-dropout transformer")
+    p.add_argument("--n-dnn", type=int, default=d.n_dnn, help="DNN ensemble members (>= 2)")
+    p.add_argument("--dnn-epochs", type=int, default=d.dnn_epochs)
+    p.add_argument("--n-probe-actions", type=int, default=d.n_probe_actions,
+                   help="random actions the DNN uncertainty of a state is averaged over")
+    p.add_argument("--demo", choices=["varied", "straight"], default=d.demo,
+                   help="tau_1: scripted reach with varied actions (default) or the straight one")
+    p.add_argument("--demo-noise", type=float, default=d.demo_noise,
+                   help="varied demo: direction-noise std (larger = more varied)")
+    p.add_argument("--td-epochs", type=int, default=d.td_epochs,
+                   help="transformer T_D epochs (--td-model transformer)")
     p.add_argument("--explore-epochs", type=int, default=d.explore_epochs)
     p.add_argument("--mc-samples", type=int, default=d.mc_samples)
     p.add_argument("--script-step", type=float, default=d.script_step,
                    help="demo (tau_1) step length, m")
     p.add_argument("--action-step", type=float, default=d.action_step,
                    help="exploration action bound, m (keep >= --script-step)")
+    p.add_argument("--fixed-step", action=argparse.BooleanOptionalAction, default=None,
+                   help="every exploration / varied-demo action exactly --action-step long "
+                        "(default: on with --td-model dnn, off with transformer)")
     p.add_argument("--s1-min-dist", type=float, default=d.s1_min_dist)
     p.add_argument("--s1-max-dist", type=float, default=d.s1_max_dist)
     p.add_argument("--no-td-suffix-aug", action="store_true")
@@ -671,15 +864,22 @@ def parse_args():
     p.add_argument("--outdir", default="fallback_results")
     p.add_argument("--smoke", action="store_true", help="tiny fast run for an end-to-end check")
     a = p.parse_args()
+    if a.keep_frac is None:
+        a.keep_frac = 1.0 if a.td_model == "dnn" else 0.5
     if not 0.0 < a.keep_frac <= 1.0:
         p.error("--keep-frac must be in (0, 1]")
+    if a.n_dnn < 2:
+        p.error("--n-dnn must be at least 2")
 
     cfg = FallbackConfig(
         k=a.k, m=a.m, max_rounds=a.max_rounds, max_retries=a.max_retries, gamma=a.gamma,
         keep_frac=a.keep_frac, mu_tol=a.mu_tol, td_epochs=a.td_epochs, explore_epochs=a.explore_epochs,
         mc_samples=a.mc_samples, script_step=a.script_step, action_step=a.action_step, s1_min_dist=a.s1_min_dist,
         s1_max_dist=a.s1_max_dist, td_suffix_aug=not a.no_td_suffix_aug,
-        token_fusion=a.token_fusion, seed=a.seed, device=a.device)
+        token_fusion=a.token_fusion, seed=a.seed, device=a.device,
+        td_model=a.td_model, n_dnn=a.n_dnn, dnn_epochs=a.dnn_epochs,
+        n_probe_actions=a.n_probe_actions, demo=a.demo, demo_noise=a.demo_noise,
+        fixed_step=a.fixed_step)
     enc_cfg = EncoderConfig(model_name=a.encoder, device=a.encoder_device, n_calib=a.n_calib)
     if a.smoke:
         cfg.k, cfg.m, cfg.max_rounds, cfg.td_epochs, cfg.explore_epochs = 3, 4, 2, 60, 10

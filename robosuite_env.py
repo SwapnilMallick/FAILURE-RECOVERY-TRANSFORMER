@@ -47,6 +47,8 @@ from ik_solver import IKConfig, RobosuiteIK
 class WorldConfig:
     step_size: float = 0.04          # max |delta-translation action|, meters
     goal_bias: float = 0.0           # prob. of sampling straight toward the cube
+    fixed_step: bool = False         # True: every action has length step_size exactly
+                                      # (random direction only); False: uniform in the ball
     max_sample_tries: int = 25
     n_collision_substeps: int = 8    # matches RRT-ROBOSUITE default
     novelty_radius: float = 0.01     # roadmap-graph merge radius, meters (~step_size/4,
@@ -142,7 +144,8 @@ class RobosuiteWorld:
                 dirv /= np.linalg.norm(dirv) + 1e-12
             # uniform-in-ball radius (cube-root of a uniform sample), the 3D
             # analogue of the 2D sampler's sqrt() for uniform-in-disk
-            mag = cfg.step_size * (rng.random() ** (1.0 / 3.0))
+            mag = (cfg.step_size if cfg.fixed_step
+                   else cfg.step_size * (rng.random() ** (1.0 / 3.0)))
             a = dirv * mag
             target = eef + a
             if not self._in_bounds(target):

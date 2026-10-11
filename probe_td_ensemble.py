@@ -55,7 +55,9 @@ import time
 import numpy as np
 import torch
 
-from fallback_explore import FallbackConfig, Traj, predict_last_mc, td_sequences, train_q
+from fallback_explore import (
+    FallbackConfig, make_varied_demo, predict_last_mc, td_sequences, train_q,
+)
 from image_encoder import EncoderConfig
 from online_cost_transformer import ImageCostTransformer, causal_mask, fuse
 from plot_fallback_3d import MU_SCALE, PLOTLY_JS
@@ -64,65 +66,6 @@ from probe_td_bands import build_td, polyline_dist
 
 ACTION_TEXT = {"random": "one random action per point",
                "tau1": "τ₁'s own action (nearest step)"}
-
-
-def make_varied_demo(noise: float, seed: int, log, tries_per_step: int = 30,
-                     max_demos: int = 20):
-    """Returns demo_fn(task, encoder, cfg) -> Traj: a scripted reach whose
-    actions vary step to step (see module docstring)."""
-    rng = np.random.default_rng(seed + 6_000_003)
-
-    def demo(task, encoder, cfg):
-        ik, world = task.ik, task.world
-        for attempt in range(1, max_demos + 1):
-            task.reset_to_start()
-            q, eef = ik.get_q(), ik.eef_pos()
-            emb = encoder.embed(ik)
-            tokens, eefs, qs = [], [eef], [q]
-            for _ in range(cfg.script_max_steps):
-                if task.reached(eef):
-                    break
-                g = task.cube_pos - eef
-                g /= np.linalg.norm(g)
-                for _try in range(tries_per_step):
-                    dirv = g + noise * rng.normal(size=3)
-                    dirv /= np.linalg.norm(dirv)
-                    a_ = dirv * cfg.action_step * rng.random() ** (1 / 3)
-                    if not world._in_bounds(eef + a_):
-                        continue
-                    q_to, ok = ik.solve_ik(eef + a_, q_init=q)
-                    if ok and not world.collides(q, q_to):
-                        break
-                    ik.set_q(q)
-                else:
-                    break                               # stuck: restart the demo
-                ik.set_q(q_to)
-                tokens.append(fuse(emb.reshape(-1), a_))
-                q, eef = q_to, ik.eef_pos()
-                emb = encoder.embed(ik)
-                eefs.append(eef)
-                qs.append(q)
-            if task.reached(eef):
-                A = np.array([t[-3:] for t in tokens])
-                U = A / np.linalg.norm(A, axis=1, keepdims=True)
-                to_goal = np.array([task.cube_pos - e for e in eefs[:-1]])
-                to_goal /= np.linalg.norm(to_goal, axis=1, keepdims=True)
-                ang = np.degrees(np.arccos(np.clip((U * to_goal).sum(1), -1, 1)))
-                cos = U @ U.T
-                log(f"varied demo (noise {noise}, attempt {attempt}): {len(tokens)} steps | "
-                    f"step length {100 * np.linalg.norm(A, axis=1).mean():.2f} cm mean "
-                    f"({100 * np.linalg.norm(A, axis=1).min():.2f}-"
-                    f"{100 * np.linalg.norm(A, axis=1).max():.2f}) | angle off the cube "
-                    f"direction {ang.mean():.0f} deg mean, {ang.max():.0f} max | mean "
-                    f"pairwise cosine between actions {cos[np.triu_indices(len(U), 1)].mean():.2f} "
-                    f"(straight demo: 1.00)")
-                T = len(tokens)
-                return Traj(tokens, eefs, qs, emb, reached=True,
-                            labels=cfg.gamma ** (T - 1 - np.arange(T, dtype=float)))
-        raise RuntimeError(f"varied demo did not reach the cube in {max_demos} attempts; "
-                           f"lower --demo-noise")
-
-    return demo
 
 
 def point_at_arclength(T: np.ndarray, s: float) -> np.ndarray:
