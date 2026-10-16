@@ -5,7 +5,7 @@ testbed, image-state tokens).
 
 T_D (--td-model)
 ----------------
-  * "dnn" (default): an ensemble of n_dnn (5) small feed-forward Q-networks
+  * "dnn" (default): an ensemble of n_dnn (10) small feed-forward Q-networks
     (dnn_ensemble.py), Q(s, a) from the current state's image embedding and
     the action, no history. mu_TD of a STATE s is
         U(s) = max_i Q^i(s, a) - min_i Q^i(s, a),
@@ -16,6 +16,30 @@ T_D (--td-model)
     into. Chosen after the band probes (probe_*.py): an ensemble's spread grew
     with distance from tau_1 where MC dropout's did not, and only when tau_1's
     actions vary -- hence the varied demo is the default too.
+  * BC hand-off (--bc, default on with "dnn"): a behaviour-cloning policy
+    (bc_policy.py) is trained INSIDE the run on every successful trajectory
+    in D (on-trajectory + corrective examples). When the fallback ends for
+    any reason except "stuck" (stop rule, round limit, s_1 certain), it takes
+    over from the path end's real joint configuration and drives toward the
+    cube. tau_2 = fallback path (s_1 -> path end) + BC rollout; only if the
+    rollout reaches the cube is tau_2 labelled with true returns and added to
+    D (the rollout is saved and plotted either way). Single iteration for
+    now; T_D, BC and T_explore are all built from D so that repeating the
+    iteration later only needs a loop around it.
+  * Online loop (--n-iters, default 1). Each iteration: (1) retrain the
+    DNN ensemble on every trajectory in D; (2) retrain BC on every trajectory
+    in D (each trajectory's corrective examples are rendered once and cached
+    across iterations); (3) cold-start T_explore (iteration 1 uses the same
+    initialisation as a single run); (4) stop tolerance = mean U over all of
+    D's states; (5) a fresh s_1, sideways 3-5 cm from tau_1; (6) fallback
+    rounds; (7) BC hand-off from the path end whenever a path exists (also
+    after getting stuck in a later round); (8) tau_k = fallback path + BC
+    rollout, labelled with true returns and added to D only if it reached the
+    cube. Distances in logs / plots are to the nearest trajectory in D.
+    A failed iteration (stuck in round 1, or BC missed the cube) adds nothing
+    but still counts. With n_iters > 1 every iteration writes to iterNN/ and
+    the top level gets iterations.csv, D.npz and D_3d.html; with 1 the
+    outputs are exactly those of a single run.
   * "transformer": the original single ImageCostTransformer with MC-dropout
     std as mu_TD, scored at (history, action) tokens. With --demo straight
     this reproduces the earlier runs.
@@ -41,7 +65,12 @@ Method (single fall-back iteration)
              to the cutoff value of mu_exp that keeps that fraction
              (keep_frac = 1.0 for the DNN T_D, so S' = S; 0.5 for the transformer)
         s* = argmax_{s in S'}  -mu_TD(s)     (the state T_D is most certain about)
-        chain  <- chain + the trajectory that reached s*, cut at s*
+        keep-best (DNN T_D, default): s* is only a CANDIDATE; the path moves
+            to it only if U(s*) < U(start), the start re-scored this round
+            (s_1 included); otherwise it stays and the next round explores
+            again from the same start (T_explore has been retrained, so the
+            retry differs)
+        chain  <- chain + the trajectory that reached s*, cut at s*  (moves only)
         stop   if  mu_TD(s*) ~ 0, i.e. mu_TD(s*) < mu_tol  (T_D is certain at s*:
                it looks like a tau_1 state)
         start <- s*  (with the history of the trajectory up to s*)
@@ -86,6 +115,15 @@ Interpretation choices (the method text leaves these open)
     its direction random -- so tau_1 and exploration use the same step size
     (with the straight demo's 1 cm steps too). Off, lengths are uniform in
     the action_step ball (mean 0.75 cm), as in the transformer runs.
+  * Keep-best (keep_best; default on for the DNN T_D). Without it, every
+    round had to move to one of its new states even when all were worse than
+    the start (seed 7, fixed steps: 6 of 9 moves raised U; one gave up a
+    0.6 cm state for a 3.2 cm one), so the path could drift away from tau_1.
+    With it, U along the path never increases. The start is re-scored each
+    round with fresh random actions, so it is compared at a typical value
+    rather than the lucky minimum it was chosen at. The stop rule tests the
+    path's current end; if that is still s_1 the run stops without a tau_2
+    (stop reason "s1_certain").
   * DNN T_D: s* is chosen by U over ALL visited states (keep_frac = 1.0). In
     the first DNN runs the mu_exp filter removed the state closest to tau_1
     in 4-5 of 10 rounds -- once the single lowest-U state of the round --
@@ -105,8 +143,18 @@ Interpretation choices (the method text leaves these open)
     clear of zero over the longer horizon. The encoder's calibration random
     walk keeps the world's default 4 cm step so its standardization stats
     cover the same workspace region regardless of action_step.
-  * s_1 is s_0's EEF displaced by a random direction with norm in
-    [s1_min_dist, s1_max_dist], IK-reachable and collision-free.
+  * s_1 (s1_dir). "horizontal" (default for the DNN T_D): s_0's EEF moved
+    in a random horizontal direction (same height) so that it is
+    s1_min_dist..s1_max_dist from the nearest state of ANY trajectory in D
+    (with D = {tau_1}: from tau_1), so later starts are not placed next to
+    trajectories already in D; up to 10 sampling attempts, else that
+    iteration is skipped ("no_s1"). "lateral": s_0's EEF moved
+    exactly sideways from tau_1 -- along the horizontal axis perpendicular to
+    tau_1's overall direction s_0 -> end, left or right at random ("left" =
+    left when facing along tau_1 toward the cube) -- so that it is
+    s1_min_dist..s1_max_dist (3-5 cm) from the NEAREST tau_1 state.
+    "any" (the transformer runs): 3-5 cm from s_0 in a random 3-D direction.
+    Both IK-reachable and collision-free.
 
 Tokens are [ DINOv2 embeddings of agentview/sideview/frontview (V*D) , EEF
 displacement action (3) ], exactly as in the rest of this project
@@ -127,20 +175,27 @@ import csv
 import json
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
 
 from image_encoder import EncoderConfig, ImageEncoder
+from bc_policy import (
+    BCConfig, BCPolicy, bc_rollout, build_bc_dataset, merge_bc_datasets, train_bc,
+)
 from dnn_ensemble import DNNEnsemble, train_dnn_ensemble
-from plot_fallback_3d import PATH_COLOR, write_html
+from plot_fallback_3d import BC_COLOR, PATH_COLOR, write_html
 from online_cost_transformer import (
     ImageCostTransformer, causal_mask, collate, fuse, huber_loss, predict_last_mc,
 )
 from robosuite_env import WorldConfig
 from task import RobosuiteTask, TaskConfig
+
+
+S1_ATTEMPTS = 10                         # s_1 sampling attempts per iteration (each up to
+                                         # 400 placements) before the iteration is skipped
 
 
 @dataclass
@@ -166,7 +221,8 @@ class FallbackConfig:
     # --- T_D: "dnn" = ensemble of feed-forward Q-nets (dnn_ensemble.py),
     #     "transformer" = the single MC-dropout ImageCostTransformer ---
     td_model: str = "dnn"
-    n_dnn: int = 5                       # ensemble members
+    n_dnn: int = 10                      # ensemble members (10 beat 5 over 29 seeds:
+                                         # 15 vs 7 runs ended within 1 cm of tau_1)
     dnn_hidden: int = 256
     dnn_epochs: int = 400
     dnn_lr: float = 1e-3
@@ -183,6 +239,8 @@ class FallbackConfig:
     # --- s_1 ---
     s1_min_dist: float = 0.03            # s_1 lies 3-5 cm from s_0 (was 4-8 cm)
     s1_max_dist: float = 0.05
+    s1_dir: Optional[str] = None         # "horizontal" | "lateral" (left/right of tau_1) | "any";
+                                         # None = lateral for dnn, any for transformer
 
     # --- exploration ---
     action_step: float = 0.01            # exploration action bound (m), = world step_size
@@ -194,6 +252,19 @@ class FallbackConfig:
     max_retries: int = 10                # action resamples per step
     explore_epochs: int = 60             # T_explore epochs per round
     max_rounds: int = 10
+    # --- online loop: iterations over a growing D (T_D + BC retrained on D,
+    #     T_explore cold-started, a fresh s_1 each iteration) ---
+    n_iters: int = 1
+
+    # --- BC hand-off (bc_policy.py): trained on D inside the run; takes over
+    #     from the fallback path's end when the fallback ends (unless stuck) ---
+    bc: Optional[bool] = None            # None = True for dnn, False for transformer
+    bc_n_aug: int = 20                   # corrective examples per state of each D trajectory
+    bc_epochs: int = 500
+    bc_lookahead: int = 2
+    bc_max_steps_mult: float = 2.0       # rollout step limit = this x tau_1's length
+    keep_best: Optional[bool] = None     # move to s* only if it beats the (re-scored) start;
+                                         # None = True for dnn, False for transformer
     keep_frac: Optional[float] = None    # S' = top keep_frac of visited states by mu_exp;
                                          # None = 1.0 (all) for dnn, 0.5 for transformer
     mu_tol: Optional[float] = None       # stop when mu_TD(s*) < mu_tol;
@@ -336,14 +407,67 @@ def make_varied_demo(noise: float, seed: int, log, tries_per_step: int = 30,
 # --------------------------------------------------------------------------- #
 # s_1: a start state close to s_0
 # --------------------------------------------------------------------------- #
-def sample_nearby_start(task: RobosuiteTask, cfg: FallbackConfig, rng, tries: int = 200):
+def lateral_axis(ref_dir: np.ndarray) -> np.ndarray:
+    """Horizontal unit vector perpendicular to ref_dir (tau_1's overall
+    direction), pointing LEFT for someone facing along ref_dir:
+    up x horizontal(ref_dir). Falls back to +y if ref_dir is vertical."""
+    h = np.array([ref_dir[0], ref_dir[1], 0.0])
+    if np.linalg.norm(h) < 1e-9:
+        return np.array([0.0, 1.0, 0.0])
+    h /= np.linalg.norm(h)
+    return np.array([-h[1], h[0], 0.0])
+
+
+def sample_nearby_start(task: RobosuiteTask, cfg: FallbackConfig, rng,
+                        tau1_pts: Optional[np.ndarray] = None,
+                        ref_pts: Optional[np.ndarray] = None, tries: int = 400):
+    """s_1 near s_0, IK-reachable, in-bounds and collision-free.
+      cfg.s1_dir "horizontal" (DNN default): s_0's EEF moved in a uniformly
+        random horizontal direction (same height), such that its distance to
+        the NEAREST state of ANY trajectory in D (ref_pts) is in
+        [s1_min_dist, s1_max_dist]. Every trajectory added to D starts near
+        s_0, so D crowds the area around s_0 as it grows; the offset from s_0
+        is therefore searched over [s1_min_dist, 3 * s1_max_dist].
+      "lateral": the same, but only exactly sideways from tau_1 (along
+        lateral_axis of tau_1's overall direction), left or right at random,
+        offset searched over [s1_min_dist, 2 * s1_max_dist].
+      "any": s_0's EEF moved by s1_min_dist..s1_max_dist in a uniformly
+        random 3-D direction (distance measured from s_0; transformer runs).
+    ref_pts defaults to tau_1's states. Returns (q_1, eef_1, side): side is
+    "left"/"right" (lateral), e.g. "left (+97 deg)" (horizontal, angle from
+    tau_1's forward direction, + = left), or None (any)."""
     ik, world = task.ik, task.world
     task.reset_to_start()
     q0, e0 = task.q_start.copy(), task.eef_start.copy()
+    ref = tau1_pts if ref_pts is None else ref_pts
+    banded = cfg.s1_dir in ("lateral", "horizontal")
+    if banded:
+        assert tau1_pts is not None, "lateral / horizontal s_1 needs tau_1"
+        lat = lateral_axis(tau1_pts[-1] - tau1_pts[0])
+        fwd = np.array([lat[1], -lat[0], 0.0])           # horizontal forward along tau_1
+
+    def ref_dist(p):
+        return float(np.linalg.norm(ref - p, axis=1).min())
+
     for _ in range(tries):
-        d = rng.normal(size=3)
-        d /= np.linalg.norm(d)
-        target = e0 + d * rng.uniform(cfg.s1_min_dist, cfg.s1_max_dist)
+        side = None
+        if cfg.s1_dir == "lateral":
+            side = "left" if rng.random() < 0.5 else "right"
+            d = lat if side == "left" else -lat
+            target = e0 + d * rng.uniform(cfg.s1_min_dist, 2 * cfg.s1_max_dist)
+        elif cfg.s1_dir == "horizontal":
+            th = rng.uniform(0.0, 2 * np.pi)
+            d = np.array([np.cos(th), np.sin(th), 0.0])
+            ang = float(np.degrees(np.arctan2(d @ lat, d @ fwd)))  # + = left of tau_1
+            side = ("ahead" if abs(ang) < 45 else "behind" if abs(ang) > 135
+                    else "left" if ang > 0 else "right") + f" ({ang:+.0f} deg)"
+            target = e0 + d * rng.uniform(cfg.s1_min_dist, 3 * cfg.s1_max_dist)
+        else:
+            d = rng.normal(size=3)
+            d /= np.linalg.norm(d)
+            target = e0 + d * rng.uniform(cfg.s1_min_dist, cfg.s1_max_dist)
+        if banded and not cfg.s1_min_dist <= ref_dist(target) <= cfg.s1_max_dist:
+            continue
         if not world._in_bounds(target) or task.reached(target):
             continue
         q1, ok = ik.solve_ik(target, q_init=q0)
@@ -354,7 +478,10 @@ def sample_nearby_start(task: RobosuiteTask, cfg: FallbackConfig, rng, tries: in
             ik.set_q(q0)
             continue
         ik.set_q(q1)
-        return q1, ik.eef_pos()
+        if banded and not cfg.s1_min_dist <= ref_dist(ik.eef_pos()) <= cfg.s1_max_dist:
+            ik.set_q(q0)                    # IK landed just outside the band
+            continue
+        return q1, ik.eef_pos(), side
     raise RuntimeError("could not find a collision-free s_1 near s_0")
 
 
@@ -517,7 +644,7 @@ def build_tau2(chain_tokens, chain_eefs, chain_qs, end_emb, tau1: Traj, tau1_pts
 # Plotting
 # --------------------------------------------------------------------------- #
 def save_plots(outdir, tau1: Traj, s1_eef, rounds_trajs, s_stars, cube,
-               chain_eefs, made_tau2):
+               chain_eefs, made_tau2, bc_eefs=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -543,6 +670,9 @@ def save_plots(outdir, tau1: Traj, s1_eef, rounds_trajs, s_stars, cube,
     C = np.asarray(chain_eefs)
     ax.plot(C[:, 0], C[:, 1], C[:, 2], color=PATH_COLOR, lw=2.6,
             label=r"fallback path $s_1 \to s^*$" + (r" ($\tau_2$)" if made_tau2 else " (unfinished)"))
+    if bc_eefs is not None and len(bc_eefs) > 1:
+        ax.plot(bc_eefs[:, 0], bc_eefs[:, 1], bc_eefs[:, 2], color=BC_COLOR, lw=2.6,
+                ls="-" if made_tau2 else "--", label="BC rollout")
     ax.scatter(*cube, color="tab:red", s=80, label="cube")
     ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
     ax.legend(fontsize=7, loc="upper left")
@@ -558,11 +688,102 @@ def save_plots(outdir, tau1: Traj, s1_eef, rounds_trajs, s_stars, cube,
 # --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
+def write_iteration_outputs(outdir, it_rows, D, cube, seed, log):
+    """Top-level outputs of a multi-iteration run: iterations.csv (one row
+    per iteration), D.npz (every trajectory in D) and D_3d.html (all of D)."""
+    with open(os.path.join(outdir, "iterations.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(it_rows[0].keys()))
+        w.writeheader()
+        w.writerows(it_rows)
+    arrays = {}
+    for j, tr in enumerate(D, start=1):
+        arrays[f"tau{j}_eefs"] = np.asarray(tr.eefs)
+        arrays[f"tau{j}_qs"] = np.asarray(tr.qs)
+        arrays[f"tau{j}_tokens"] = np.asarray(tr.tokens)
+        arrays[f"tau{j}_labels"] = np.asarray(tr.labels)
+    np.savez(os.path.join(outdir, "D.npz"), n=len(D), **arrays)
+    write_D_html(outdir, D, it_rows, cube, seed)
+    log(f"\n{'=' * 24} {len(it_rows)} iterations done {'=' * 24}")
+    fmt = lambda v, f: "-" if v is None else format(v, f)
+    log(f"{'iter':>4} {'s1 direction':>18} {'s1->D':>6} {'stop':>13} {'rnds':>4} {'end->D':>6} "
+        f"{'near':>4} {'BC':>9} {'added':>5} {'|D|':>3} {'sec':>6}")
+    for r in it_rows:
+        log(f"{r['iteration']:>4} {str(r['s1_side']):>18} {fmt(r['s1_dist_D_cm'], '.1f'):>6} {r['stop']:>13} "
+            f"{r['rounds']:>4} {fmt(r['path_end_dist_D_cm'], '.2f'):>6} "
+            f"{('tau' + str(r['path_end_nearest_traj'])) if r['path_end_nearest_traj'] else '-':>4} "
+            f"{str(r['bc']):>9} {str(r['added']):>5} {r['D_size']:>3} {r['sec']:>6.0f}")
+    log(f"outputs -> {outdir}/ (iterations.csv, D.npz, D_3d.html, iter01/ ... iter{len(it_rows):02d}/)")
+
+
+def write_D_html(outdir, D, it_rows, cube, seed):
+    """Interactive overview of every trajectory in D (tau_1 black, the added
+    ones coloured by the iteration that produced them)."""
+    from plot_fallback_3d import EPS_DIST, PLOTLY_JS, _sphere, _viridis
+    added_iters = [r["iteration"] for r in it_rows if r["added"]]
+    traces = []
+    for j, tr in enumerate(D):
+        E = np.asarray(tr.eefs)
+        name = "τ₁ (demo)" if j == 0 else f"τ{j + 1} (iteration {added_iters[j - 1]}, {len(E) - 1} steps)"
+        col = "black" if j == 0 else _viridis(j - 1, max(len(D) - 1, 1))
+        traces.append(dict(type="scatter3d", mode="lines+markers", name=name,
+                           x=E[:, 0].tolist(), y=E[:, 1].tolist(), z=E[:, 2].tolist(),
+                           text=[f"{name}<br>step {i}" for i in range(len(E))],
+                           hovertemplate="%{text}<extra></extra>",
+                           line=dict(color=col, width=7 if j == 0 else 4), marker=dict(color=col, size=2)))
+    started = [r for r in it_rows if r["s1"] is not None]
+    S1 = np.asarray([r["s1"] for r in started]).reshape(-1, 3)
+    traces.append(dict(type="scatter3d", mode="markers", name="s₁ of each iteration",
+                       x=S1[:, 0].tolist(), y=S1[:, 1].tolist(), z=S1[:, 2].tolist(),
+                       text=[f"s₁, iteration {r['iteration']} ({r['s1_side']}) → "
+                             f"{'added' if r['added'] else 'not added'}" for r in started],
+                       hovertemplate="%{text}<extra></extra>",
+                       marker=dict(color="royalblue", size=5, line=dict(color="black", width=1))))
+    traces.append(dict(type="scatter3d", mode="markers", name="cube", x=[float(cube[0])],
+                       y=[float(cube[1])], z=[float(cube[2])], hoverinfo="skip",
+                       marker=dict(color="red", size=9, symbol="square")))
+    traces.append(_sphere(np.asarray(cube), EPS_DIST))
+    page = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buffer D</title>
+<script src="{PLOTLY_JS}"></script>
+<style>
+ html, body {{ margin: 0; height: 100%; background: #fafafa; color: #222;
+   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+ header {{ padding: 10px 16px 4px; }} h1 {{ font-size: 17px; margin: 0 0 2px; }}
+ .sub {{ font-size: 13px; color: #555; }}
+ #plot {{ height: calc(100% - 60px); min-height: 420px; }}
+</style></head><body>
+<header><h1>Buffer D after {len(it_rows)} iterations (seed {seed}): {len(D)} trajectories</h1>
+<div class="sub">τ₁ black, added trajectories coloured by iteration · blue dots = each iteration's s₁ ·
+ click legend entries to show/hide · each iteration's folder has its own fallback pages</div></header>
+<div id="plot"></div>
+<script>
+Plotly.newPlot("plot", {json.dumps(traces)}, {{
+  margin: {{l: 0, r: 0, t: 0, b: 0}}, paper_bgcolor: "#fafafa",
+  legend: {{x: 0.01, y: 0.99, bgcolor: "rgba(255,255,255,0.8)", font: {{size: 11}}}},
+  scene: {{aspectmode: "data", xaxis: {{title: "x (m)"}}, yaxis: {{title: "y (m)"}},
+           zaxis: {{title: "z (m)"}}, camera: {{eye: {{x: 1.4, y: 1.4, z: 0.9}}}}}}
+}}, {{responsive: true, displaylogo: false}});
+</script></body></html>
+"""
+    with open(os.path.join(outdir, "D_3d.html"), "w") as f:
+        f.write(page)
+
+
 def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
     if cfg.keep_frac is None:
         cfg.keep_frac = 1.0 if cfg.td_model == "dnn" else 0.5
     if cfg.fixed_step is None:
         cfg.fixed_step = cfg.td_model == "dnn"
+    if cfg.s1_dir is None:
+        cfg.s1_dir = "horizontal" if cfg.td_model == "dnn" else "any"
+    if cfg.keep_best is None:
+        cfg.keep_best = cfg.td_model == "dnn"
+    if cfg.bc is None:
+        cfg.bc = cfg.td_model == "dnn"
+    if cfg.keep_best and cfg.td_model != "dnn":
+        raise ValueError("keep_best needs the DNN T_D (a per-state score for the start)")
     os.makedirs(outdir, exist_ok=True)
     torch.manual_seed(cfg.seed)
     rng = np.random.default_rng(cfg.seed)
@@ -618,200 +839,347 @@ def main(cfg: FallbackConfig, enc_cfg: EncoderConfig, outdir: str):
     tau1_pts = np.asarray(tau1.eefs)
     log(f"\ntau_1 ({cfg.demo} demo): {len(tau1.tokens)} steps, start {tau1.eefs[0].round(3)} -> "
         f"end {tau1.eefs[-1].round(3)} (dist to cube {task.dist_to_cube(tau1.eefs[-1]):.3f})")
-    dnn = None
-    if cfg.td_model == "dnn":
-        log(f"T_D = ensemble of {cfg.n_dnn} feed-forward Q-nets (no history); mu_TD of a "
-            f"state = U = max - min of their Q, mean over {cfg.n_probe_actions} random actions")
-        models = train_dnn_ensemble(
-            np.stack([tok[:-3] for tok in tau1.tokens]), np.stack([tok[-3:] for tok in tau1.tokens]),
-            tau1.labels, cfg.n_dnn, cfg.dnn_hidden, cfg.dnn_epochs, cfg.dnn_lr, cfg.seed,
-            cfg.action_step, log)
-        dnn = DNNEnsemble(models, cfg.action_step, cfg.n_probe_actions,
-                          np.random.default_rng(cfg.seed + 8_000_003),
-                          fixed_len=bool(cfg.fixed_step))
-        # every tau_1 state (s_0 .. s_T) scored exactly like an explored state
-        qu_tau1 = [dnn.state_u(e) for e in
-                   [tok[:-3] for tok in tau1.tokens] + [tau1.end_emb.reshape(-1)]]
-        mu_all_states = np.array([u for _, u in qu_tau1])
-        # stored per token t (= state t+1), the convention plot_fallback_3d reads
-        tau1_q_td = [q for q, _ in qu_tau1[1:]]
-        mu_tau1 = mu_all_states[1:]
-        mu_ref = mu_all_states
-    else:
-        loss_d = train_q(T_D, td_sequences(tau1, cfg), cfg.td_epochs, cfg, train_rng)
-        q_fit = [predict_last_mc(T_D, tau1.tokens[:t + 1], cfg) for t in range(len(tau1.tokens))]
-        log(f"T_D trained ({cfg.td_epochs} epochs, final loss {loss_d:.2e}); "
-            f"fit on tau_1 (label / Q_TD +- mu):")
-        log("   " + "  ".join(f"{l:.3f}/{q:.3f}+-{s:.3f}" for l, (q, s) in zip(tau1.labels, q_fit)))
-        tau1_q_td = [q for q, _ in q_fit]
-        mu_tau1 = np.array([sd for _, sd in q_fit])
-        mu_ref = mu_tau1
-    mu_tol = cfg.mu_tol if cfg.mu_tol is not None else float(mu_ref.mean())
-    log(f"stop when mu_TD(s*) < mu_tol = {mu_tol:.4f}"
-        f"{'' if cfg.mu_tol is not None else '  (mean mu_TD over tau_1)'}  | mu_TD on "
-        f"tau_1: min {mu_ref.min():.4f} mean {mu_ref.mean():.4f} max {mu_ref.max():.4f}")
+    # ================= online loop: n_iters iterations over a growing D =================
+    multi = cfg.n_iters > 1
+    bc_cache: List[dict] = []          # per-trajectory BC datasets, aligned with D
+    it_rows = []
+    summary = None
+    for it in range(1, cfg.n_iters + 1):
+        t_it = time.time()
+        it_dir = os.path.join(outdir, f"iter{it:02d}") if multi else outdir
+        os.makedirs(it_dir, exist_ok=True)
+        D_iter = list(D)                # D as it is during this iteration
+        D_pts = np.concatenate([np.asarray(tr.eefs) for tr in D_iter])
+        D_owner = np.concatenate([np.full(len(tr.eefs), j) for j, tr in enumerate(D_iter)])
+        if multi:
+            log(f"\n{'=' * 24} iteration {it}/{cfg.n_iters} | |D| = {len(D)} {'=' * 24}")
+        if it > 1:                      # T_explore: cold start every iteration
+            torch.manual_seed(cfg.seed + 1 + 1000 * (it - 1))
+            T_exp = new_model()
+        dnn = None
+        if cfg.td_model == "dnn":
+            log(f"T_D = ensemble of {cfg.n_dnn} feed-forward Q-nets (no history); mu_TD of a "
+                f"state = U = max - min of their Q, mean over {cfg.n_probe_actions} random actions")
+            # trained on every (state, action) -> Q pair of every trajectory in D
+            models = train_dnn_ensemble(
+                np.concatenate([np.stack([tok[:-3] for tok in tr.tokens]) for tr in D]),
+                np.concatenate([np.stack([tok[-3:] for tok in tr.tokens]) for tr in D]),
+                np.concatenate([tr.labels for tr in D]), cfg.n_dnn, cfg.dnn_hidden, cfg.dnn_epochs,
+                cfg.dnn_lr, cfg.seed, cfg.action_step, log)
+            dnn = DNNEnsemble(models, cfg.action_step, cfg.n_probe_actions,
+                              np.random.default_rng(cfg.seed + 8_000_003 + 1000 * (it - 1)),
+                              fixed_len=bool(cfg.fixed_step))
+            # every state of every D trajectory scored exactly like an explored
+            # state; the stop tolerance is their mean (tau_1 first, as before)
+            qu_D = [[dnn.state_u(e) for e in [tok[:-3] for tok in tr.tokens] + [tr.end_emb.reshape(-1)]]
+                    for tr in D]
+            qu_tau1 = qu_D[0]
+            mu_all_states = np.array([u for qu in qu_D for _, u in qu])
+            # stored per token t (= state t+1), the convention plot_fallback_3d reads
+            tau1_q_td = [q for q, _ in qu_tau1[1:]]
+            mu_tau1 = np.array([u for _, u in qu_tau1[1:]])
+            mu_ref = mu_all_states
+        else:
+            loss_d = train_q(T_D, td_sequences(tau1, cfg), cfg.td_epochs, cfg, train_rng)
+            q_fit = [predict_last_mc(T_D, tau1.tokens[:t + 1], cfg) for t in range(len(tau1.tokens))]
+            log(f"T_D trained ({cfg.td_epochs} epochs, final loss {loss_d:.2e}); "
+                f"fit on tau_1 (label / Q_TD +- mu):")
+            log("   " + "  ".join(f"{l:.3f}/{q:.3f}+-{s:.3f}" for l, (q, s) in zip(tau1.labels, q_fit)))
+            tau1_q_td = [q for q, _ in q_fit]
+            mu_tau1 = np.array([sd for _, sd in q_fit])
+            mu_ref = mu_tau1
+        mu_tol = cfg.mu_tol if cfg.mu_tol is not None else float(mu_ref.mean())
+        log(f"stop when mu_TD(s*) < mu_tol = {mu_tol:.4f}"
+            f"{'' if cfg.mu_tol is not None else f'  (mean mu_TD over the {len(mu_ref)} states of D)'}"
+            f"  | mu_TD on D: min {mu_ref.min():.4f} mean {mu_ref.mean():.4f} max {mu_ref.max():.4f}")
 
-    # ---- s_1 ----
-    q1, s1_eef = sample_nearby_start(task, cfg, rng)
-    emb1 = encoder.embed(task.ik)
-    log(f"s_1 = {s1_eef.round(3)}  (|s_1 - s_0| = {np.linalg.norm(s1_eef - task.eef_start):.3f} m, "
-        f"dist to tau_1 = {min_dist_to([s1_eef], tau1_pts):.3f} m)")
+        # ---- BC policy, trained on D (every successful trajectory) inside the run ----
+        policy, bcfg = None, None
+        if cfg.bc:
+            bcfg = BCConfig(n_aug=cfg.bc_n_aug, epochs=cfg.bc_epochs, lookahead=cfg.bc_lookahead,
+                            seed=cfg.seed)
+            # BC training draws from torch's global RNG; restore it afterwards so
+            # adding BC leaves the fallback (T_explore's dropout etc.) unchanged
+            torch_state = torch.get_rng_state()
+            for j, tr in enumerate(D[len(bc_cache):], start=len(bc_cache)):
+                # generated once per trajectory (rendering is the cost); own seed per trajectory
+                bc_cache.append(build_bc_dataset(task, encoder, tr, replace(bcfg, seed=cfg.seed + 1000 * j),
+                                                 log))
+            bc_data = merge_bc_datasets(bc_cache)
+            bc_model = train_bc(bc_data, bcfg, log)
+            torch.set_rng_state(torch_state)
+            policy = BCPolicy(bc_model, cfg.action_step)
 
-    start_q, start_emb, start_hist, start_eef = q1, emb1, [], s1_eef
-    start_hist_qu: List[Tuple[float, float]] = []
-    # the full, untruncated s_1 -> s*_1 -> s*_2 -> ... chain (becomes tau_2)
-    chain_tokens: List[np.ndarray] = []
-    chain_eefs: List[np.ndarray] = [s1_eef]
-    chain_qs: List[np.ndarray] = [q1]
-    explore_buffer: List[Traj] = []
-    rounds_trajs, s_stars, rows = [], [], []
-    state_scores = []          # per round: every visited state's scores (summary.json)
-    tau2: Optional[Traj] = None
-    stop_reason = "max_rounds"
+        # ---- s_1: s1_min..max_dist from every trajectory in D, 10 sampling attempts ----
+        s1 = None
+        for attempt in range(1, S1_ATTEMPTS + 1):
+            try:
+                s1 = sample_nearby_start(task, cfg, rng, tau1_pts, ref_pts=D_pts)
+                break
+            except RuntimeError:
+                log(f"s_1 sampling attempt {attempt}/{S1_ATTEMPTS} failed (no valid start "
+                    f"{100 * cfg.s1_min_dist:.0f}-{100 * cfg.s1_max_dist:.0f} cm from D)")
+        if s1 is None:
+            log(f"no valid s_1 after {S1_ATTEMPTS} attempts -- skipping iteration {it}")
+            it_rows.append(dict(
+                iteration=it, s1=None, s1_side=None, s1_dist_tau1_cm=None, s1_dist_D_cm=None,
+                stop="no_s1", rounds=0, path_end_dist_D_cm=None, path_end_nearest_traj=None,
+                bc=None, bc_steps=None, added=False, D_size=len(D),
+                sec=round(time.time() - t_it, 1)))
+            continue
+        q1, s1_eef, s1_side = s1
+        emb1 = encoder.embed(task.ik)
+        log(f"s_1 = {s1_eef.round(3)}  (|s_1 - s_0| = {np.linalg.norm(s1_eef - task.eef_start):.3f} m, "
+            f"dist to D = {min_dist_to([s1_eef], D_pts):.3f} m, to tau_1 = "
+            f"{min_dist_to([s1_eef], tau1_pts):.3f} m"
+            + (f"; direction from s_0: {s1_side} relative to tau_1)" if s1_side else ")"))
 
-    hdr = (f"{'rnd':>3} {'steps':>5} {'stuck':>5} {'rej':>5} {'sfail':>5} {'reach':>5} "
-           f"{'loss_exp':>9} {'Q_TD*':>7} {'mu_TD*':>7} {'Q_exp*':>7} {'mu_exp*':>7} "
-           f"{'d(s*,t1)':>8} {'dmin,t1':>8} {'sec':>6}")
-    log("\n" + hdr)
-    for rnd in range(1, cfg.max_rounds + 1):
-        t_r = time.time()
-        # max_len keeps the positional table valid: inherited history + m new steps
-        keep_n = cfg.max_len - cfg.m
-        hist = start_hist[-keep_n:] if keep_n > 0 else []
-        hist_qu = start_hist_qu[-keep_n:] if keep_n > 0 else []
-        trajs = [collect_exploration_trajectory(T_D, T_exp, task, encoder, cfg, rng,
-                                                start_q, start_emb, hist, dnn, hist_qu)
-                 for _ in range(cfg.k)]
-        explore_buffer.extend(trajs)
-        loss_e = train_q(T_exp, explore_sequences(explore_buffer, cfg),
-                         cfg.explore_epochs, cfg, train_rng)
+        start_q, start_emb, start_hist, start_eef = q1, emb1, [], s1_eef
+        start_hist_qu: List[Tuple[float, float]] = []
+        # the fallback path's current end (where BC takes over): joints, embedding, EEF
+        path_q, path_emb, path_eef = q1, emb1, s1_eef
+        # the full, untruncated s_1 -> s*_1 -> s*_2 -> ... chain (becomes tau_2)
+        chain_tokens: List[np.ndarray] = []
+        chain_eefs: List[np.ndarray] = [s1_eef]
+        chain_qs: List[np.ndarray] = [q1]
+        explore_buffer: List[Traj] = []
+        rounds_trajs, s_stars, rows = [], [], []
+        state_scores = []          # per round: every visited state's scores (summary.json)
+        tau2: Optional[Traj] = None
+        stop_reason = "max_rounds"
+        round_moved: List[bool] = []       # per round: did the path move to that round's s*?
 
-        # ---- s*: S = all visited states, S' = top keep_frac by mu_exp, s* = min mu_TD in S' ----
-        # state j (1..n_new) of trajectory t is scored at the token that led
-        # into it, position hist_len + j - 1 (see module docstring)
-        S = []                                  # (traj, j, q_td, mu_td, q_exp, mu_exp)
-        for t in trajs:
-            if t.n_new == 0:
-                continue
-            if dnn is not None:                 # U(s_j) was scored when s_j was reached
-                q_td_all = [q for q, _ in t.tok_qu]
-                mu_td_all = [u for _, u in t.tok_qu]
+        hdr = (f"{'rnd':>3} {'steps':>5} {'stuck':>5} {'rej':>5} {'sfail':>5} {'reach':>5} "
+               f"{'loss_exp':>9} {'Q_TD*':>7} {'mu_TD*':>7} {'Q_exp*':>7} {'mu_exp*':>7} "
+               f"{'d(s*,D)':>8} {'dmin,D':>8} {'sec':>6}" + (f" {'move':>5}" if cfg.keep_best else ""))
+        log("\n" + hdr)
+        for rnd in range(1, cfg.max_rounds + 1):
+            t_r = time.time()
+            if cfg.keep_best:                       # re-score the start with fresh random actions
+                start_qtd, start_u = dnn.state_u(start_emb)
+            # max_len keeps the positional table valid: inherited history + m new steps
+            keep_n = cfg.max_len - cfg.m
+            hist = start_hist[-keep_n:] if keep_n > 0 else []
+            hist_qu = start_hist_qu[-keep_n:] if keep_n > 0 else []
+            trajs = [collect_exploration_trajectory(T_D, T_exp, task, encoder, cfg, rng,
+                                                    start_q, start_emb, hist, dnn, hist_qu)
+                     for _ in range(cfg.k)]
+            explore_buffer.extend(trajs)
+            loss_e = train_q(T_exp, explore_sequences(explore_buffer, cfg),
+                             cfg.explore_epochs, cfg, train_rng)
+
+            # ---- s*: S = all visited states, S' = top keep_frac by mu_exp, s* = min mu_TD in S' ----
+            # state j (1..n_new) of trajectory t is scored at the token that led
+            # into it, position hist_len + j - 1 (see module docstring)
+            S = []                                  # (traj, j, q_td, mu_td, q_exp, mu_exp)
+            for t in trajs:
+                if t.n_new == 0:
+                    continue
+                if dnn is not None:                 # U(s_j) was scored when s_j was reached
+                    q_td_all = [q for q, _ in t.tok_qu]
+                    mu_td_all = [u for _, u in t.tok_qu]
+                else:
+                    q_td_all, mu_td_all = mc_all(T_D, t.tokens, cfg)
+                q_e_all, mu_e_all = mc_all(T_exp, t.tokens, cfg)
+                for j in range(1, t.n_new + 1):
+                    p = t.hist_len + j - 1
+                    S.append((t, j, float(q_td_all[p]), float(mu_td_all[p]),
+                              float(q_e_all[p]), float(mu_e_all[p])))
+            if not S:
+                stop_reason = "stuck"
+                log(f"{rnd:>3}  every trajectory was stuck at its first step -- stopping")
+                break
+            mu_e_S = np.array([c[5] for c in S])
+            n_keep = max(1, int(np.ceil(cfg.keep_frac * len(S))))
+            S_prime = sorted(S, key=lambda c: -c[5])[:n_keep]
+            alpha = S_prime[-1][5]                  # this round's effective threshold
+            log(f"    |S| = {len(S)}  mu_exp over S: min {mu_e_S.min():.4f} median "
+                f"{np.median(mu_e_S):.4f} max {mu_e_S.max():.4f}  ->  |S'| = {len(S_prime)} "
+                f"(top {cfg.keep_frac:.0%}, alpha = {alpha:.4f})")
+            best, j_star, q_d, mu_d, q_e, mu_e = min(S_prime, key=lambda c: c[3])
+            s_star = best.eefs[j_star]
+            i_star = next(i for i, t in enumerate(trajs) if t is best)
+            log(f"    s* = traj {i_star} state {j_star}/{best.n_new}: mu_TD "
+                f"{mu_d:.4f} (S' range {min(c[3] for c in S_prime):.4f}-"
+                f"{max(c[3] for c in S_prime):.4f}), {min_dist_to([s_star], D_pts):.3f} m "
+                f"from D; closest state in S' is "
+                f"{min(min_dist_to([c[0].eefs[c[1]]], D_pts) for c in S_prime):.3f} m")
+            cand_dist = min_dist_to([s_star], D_pts)
+            moved = (not cfg.keep_best) or mu_d < start_u
+            if cfg.keep_best:
+                if moved:
+                    log(f"    MOVE: U(s*) {mu_d:.4f} < U(start) {start_u:.4f} (re-scored) -> path "
+                        f"end {min_dist_to([start_eef], D_pts):.3f} -> {cand_dist:.3f} m from D")
+                else:
+                    log(f"    STAY: best new state U {mu_d:.4f} ({cand_dist:.3f} m) does not beat "
+                        f"U(start) {start_u:.4f} ({min_dist_to([start_eef], D_pts):.3f} m); "
+                        f"next round explores from the same start")
+            # the path's end after this round: s* if moved, else the unchanged start
+            if moved:
+                path_q, path_emb, path_eef = best.qs[j_star], best.embs[j_star], s_star
+                end_eef, end_emb, cur_q, cur_u = s_star, best.embs[j_star], q_d, mu_d
             else:
-                q_td_all, mu_td_all = mc_all(T_D, t.tokens, cfg)
-            q_e_all, mu_e_all = mc_all(T_exp, t.tokens, cfg)
-            for j in range(1, t.n_new + 1):
-                p = t.hist_len + j - 1
-                S.append((t, j, float(q_td_all[p]), float(mu_td_all[p]),
-                          float(q_e_all[p]), float(mu_e_all[p])))
-        if not S:
-            stop_reason = "stuck"
-            log(f"{rnd:>3}  every trajectory was stuck at its first step -- stopping")
-            break
-        mu_e_S = np.array([c[5] for c in S])
-        n_keep = max(1, int(np.ceil(cfg.keep_frac * len(S))))
-        S_prime = sorted(S, key=lambda c: -c[5])[:n_keep]
-        alpha = S_prime[-1][5]                  # this round's effective threshold
-        log(f"    |S| = {len(S)}  mu_exp over S: min {mu_e_S.min():.4f} median "
-            f"{np.median(mu_e_S):.4f} max {mu_e_S.max():.4f}  ->  |S'| = {len(S_prime)} "
-            f"(top {cfg.keep_frac:.0%}, alpha = {alpha:.4f})")
-        best, j_star, q_d, mu_d, q_e, mu_e = min(S_prime, key=lambda c: c[3])
-        s_star = best.eefs[j_star]
-        i_star = next(i for i, t in enumerate(trajs) if t is best)
-        log(f"    s* = traj {i_star} state {j_star}/{best.n_new}: mu_TD "
-            f"{mu_d:.4f} (S' range {min(c[3] for c in S_prime):.4f}-"
-            f"{max(c[3] for c in S_prime):.4f}), {min_dist_to([s_star], tau1_pts):.3f} m "
-            f"from tau_1; closest state in S' is "
-            f"{min(min_dist_to([c[0].eefs[c[1]]], tau1_pts) for c in S_prime):.3f} m")
-        s_stars.append(s_star)
-        rounds_trajs.append(trajs)
-        kept = {id(c) for c in S_prime}
-        state_scores.append([dict(
-            traj=next(i for i, tt in enumerate(trajs) if tt is c[0]), step=c[1],
-            q_td=c[2], mu_td=c[3], q_exp=c[4], mu_exp=c[5], in_S_prime=id(c) in kept,
-            dist_tau1=min_dist_to([c[0].eefs[c[1]]], tau1_pts)) for c in S])
-        cut = best.hist_len + j_star            # tokens up to (and leading into) s*
-        chain_tokens.extend(best.tokens[best.hist_len:cut])
-        chain_eefs.extend(best.eefs[1:j_star + 1])
-        chain_qs.extend(best.qs[1:j_star + 1])
+                end_eef, end_emb, cur_q, cur_u = start_eef, start_emb, start_qtd, start_u
+                q_e = mu_e = float("nan")           # T_explore was not scored at the start
+            round_moved.append(bool(moved))
+            s_stars.append(end_eef)
+            rounds_trajs.append(trajs)
+            kept = {id(c) for c in S_prime}
+            state_scores.append([dict(
+                traj=next(i for i, tt in enumerate(trajs) if tt is c[0]), step=c[1],
+                q_td=c[2], mu_td=c[3], q_exp=c[4], mu_exp=c[5], in_S_prime=id(c) in kept,
+                dist_tau1=min_dist_to([c[0].eefs[c[1]]], D_pts)) for c in S])
+            cut = best.hist_len + j_star            # tokens up to (and leading into) s*
+            if moved:
+                chain_tokens.extend(best.tokens[best.hist_len:cut])
+                chain_eefs.extend(best.eefs[1:j_star + 1])
+                chain_qs.extend(best.qs[1:j_star + 1])
 
-        new_pts = [p for t in trajs for p in t.eefs[1:]]
-        row = dict(
-            round=rnd, start=start_eef.round(4).tolist(),
-            steps=int(sum(t.n_new for t in trajs)),
-            stuck=int(sum(t.stuck for t in trajs)),
-            rejects=int(sum(t.n_reject for t in trajs)),
-            sample_fails=int(sum(t.n_sample_fail for t in trajs)),
-            reached=int(sum(t.reached for t in trajs)),
-            n_S=len(S), n_S_prime=len(S_prime), alpha=alpha, sstar_step=j_star,
-            loss_exp=loss_e, q_td_sstar=q_d, mu_td_sstar=mu_d,
-            q_exp_sstar=q_e, mu_exp_sstar=mu_e,
-            sstar=s_star.round(4).tolist(),
-            sstar_dist_tau1=min_dist_to([s_star], tau1_pts),
-            min_dist_tau1=min_dist_to(new_pts, tau1_pts) if new_pts else float("nan"),
-            sec=time.time() - t_r,
+            new_pts = [p for t in trajs for p in t.eefs[1:]]
+            row = dict(
+                round=rnd, start=start_eef.round(4).tolist(),
+                steps=int(sum(t.n_new for t in trajs)),
+                stuck=int(sum(t.stuck for t in trajs)),
+                rejects=int(sum(t.n_reject for t in trajs)),
+                sample_fails=int(sum(t.n_sample_fail for t in trajs)),
+                reached=int(sum(t.reached for t in trajs)),
+                n_S=len(S), n_S_prime=len(S_prime), alpha=alpha, sstar_step=j_star,
+                moved=bool(moved), start_u=start_u if cfg.keep_best else float("nan"),
+                cand_u=mu_d, cand_dist_tau1=cand_dist,
+                loss_exp=loss_e, q_td_sstar=cur_q, mu_td_sstar=cur_u,
+                q_exp_sstar=q_e, mu_exp_sstar=mu_e,
+                sstar=np.asarray(end_eef).round(4).tolist(),
+                sstar_dist_tau1=min_dist_to([end_eef], D_pts),
+                min_dist_tau1=min_dist_to(new_pts, D_pts) if new_pts else float("nan"),
+                sec=time.time() - t_r,
+            )
+            rows.append(row)
+            log(f"{rnd:>3} {row['steps']:>5} {row['stuck']:>5} {row['rejects']:>5} "
+                f"{row['sample_fails']:>5} {row['reached']:>5} {loss_e:>9.2e} {cur_q:>7.3f} "
+                f"{cur_u:>7.4f} {q_e:>7.3f} {mu_e:>7.3f} {row['sstar_dist_tau1']:>8.3f} "
+                f"{row['min_dist_tau1']:>8.3f} {row['sec']:>6.1f}"
+                + (f" {'yes' if moved else 'stay':>5}" if cfg.keep_best else ""))
+
+            if cur_u < mu_tol:                      # the path's current end is certain enough
+                if not chain_tokens:                # still at s_1: nothing to make a tau_2 from
+                    stop_reason = "s1_certain"
+                    log(f"T_D certain at s_1 itself: mu_TD = {cur_u:.4f} < {mu_tol:.4f} -- "
+                        f"stopping without a tau_2")
+                    break
+                stop_reason = "mu_td_certain"
+                if cfg.bc:                          # tau_2 = this path + the BC rollout, below
+                    log(f"T_D certain at s*: mu_TD = {cur_u:.4f} < {mu_tol:.4f} -> BC takes over")
+                    break
+                tau2 = build_tau2(chain_tokens, chain_eefs, chain_qs, end_emb, tau1, tau1_pts, cfg)
+                D.append(tau2)
+                log(f"T_D certain at s*: mu_TD = {cur_u:.4f} < {mu_tol:.4f} -> tau_2 = s_1 -> "
+                    f"{sum(round_moved)} s* ({len(tau2.tokens)} steps) added to D; joins tau_1 at "
+                    f"state {tau2.join_idx}/{len(tau1.tokens)}, {row['sstar_dist_tau1']:.3f} m away")
+                break
+            if moved:
+                start_q, start_emb = best.qs[j_star], best.embs[j_star]
+                start_hist, start_eef = best.tokens[:cut], s_star
+                start_hist_qu = best.tok_qu[:cut]
+
+        # ---- BC hand-off: from the fallback path's end to the cube ----
+        bc_info = None
+        if cfg.bc and rows:                     # a path exists (not stuck in round 1)
+            max_steps = int(cfg.bc_max_steps_mult * len(tau1.tokens))
+            r = bc_rollout(policy, task, encoder, path_q, D_pts, bcfg, max_steps,
+                           rng=np.random.default_rng(cfg.seed + 12_000_003), start_emb=path_emb)
+            n_fb = len(chain_tokens)
+            bc_info = dict(success=bool(r["success"]), end=r["end"], steps=len(r["actions"]),
+                           start_dist=float(r["dist"][0]), max_dev=r["max_dev"], mean_dev=r["mean_dev"],
+                           end_dist_to_cube=100 * task.dist_to_cube(r["eefs"][-1]),
+                           eefs=r["eefs"].tolist(), dist=r["dist"].tolist())
+            log(f"\nBC takes over at the path end ({stop_reason}; {r['dist'][0]:.1f} cm from D): "
+                f"{r['end']} after {len(r['actions'])} steps | max deviation {r['max_dev']:.1f} cm, "
+                f"mean {r['mean_dev']:.1f} cm | end {bc_info['end_dist_to_cube']:.1f} cm from the cube")
+            if r["success"]:
+                toks = list(chain_tokens) + list(r["tokens"])
+                n = len(toks)
+                tau2 = Traj(toks, list(chain_eefs) + list(r["eefs"][1:]),
+                            list(chain_qs) + list(r["qs"][1:]), r["embs"][-1], reached=True,
+                            labels=cfg.gamma ** (n - 1 - np.arange(n, dtype=float)))
+                D.append(tau2)
+                log(f"tau_{len(D)} = fallback path ({n_fb} steps from s_1) + BC rollout ({len(r['actions'])} "
+                    f"steps) = {n} steps, reached the cube -> added to D (|D| = {len(D)}), labels = "
+                    f"true returns gamma^(T-1-t)")
+            else:
+                log(f"BC rollout did not reach the cube ({r['end']}): unsuccessful trajectory, "
+                    f"NOT added to D (still plotted)")
+
+        # ---- outputs ----
+        with open(os.path.join(it_dir, "rounds.csv"), "w", newline="") as f:
+            if rows:
+                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                w.writeheader()
+                w.writerows(rows)
+        summary = dict(
+            stop_reason=stop_reason, fell_back=tau2 is not None, rounds=len(rows),
+            mu_tol=mu_tol, success_buffer_size=len(D),
+            tau1_len=len(tau1.tokens), s0=task.eef_start.tolist(), s1=s1_eef.tolist(),
+            cube=task.cube_pos.tolist(), s1_side=s1_side, wall_sec=time.time() - t_it, config=asdict(cfg),
+            tau1_eefs=np.asarray(tau1.eefs).tolist(),
+            # T_D on its own demo; entry t is scored at token t, i.e. state t+1
+            tau1_q_td=list(tau1_q_td), tau1_mu_td=mu_tau1.tolist(),
+            s_stars=[np.asarray(s).tolist() for s in s_stars],   # path end after each round
+            round_moved=round_moved,
+            chain_eefs=np.asarray(chain_eefs).tolist(),     # fallback path s_1 -> ... -> last s*
+            state_scores=state_scores,
+            bc_rollout=bc_info,                              # BC hand-off (plotted even if failed)
+            iteration=it, D_eefs=[np.asarray(tr.eefs).tolist() for tr in D_iter],  # D during this iteration
+            tau2=None if tau2 is None else dict(
+                eefs=np.asarray(tau2.eefs).tolist(), qs=np.asarray(tau2.qs).tolist(),
+                actions=[t[-3:].tolist() for t in tau2.tokens], labels=tau2.labels.tolist(),
+                join_idx=tau2.join_idx),
+            exploration=[[np.asarray(t.eefs).tolist() for t in trajs] for trajs in rounds_trajs],
         )
-        rows.append(row)
-        log(f"{rnd:>3} {row['steps']:>5} {row['stuck']:>5} {row['rejects']:>5} "
-            f"{row['sample_fails']:>5} {row['reached']:>5} {loss_e:>9.2e} {q_d:>7.3f} "
-            f"{mu_d:>7.4f} {q_e:>7.3f} {mu_e:>7.3f} {row['sstar_dist_tau1']:>8.3f} "
-            f"{row['min_dist_tau1']:>8.3f} {row['sec']:>6.1f}")
-
-        if mu_d < mu_tol:
-            stop_reason = "mu_td_certain"
-            tau2 = build_tau2(chain_tokens, chain_eefs, chain_qs, best.embs[j_star],
-                              tau1, tau1_pts, cfg)
-            D.append(tau2)
-            log(f"T_D certain at s*: mu_TD = {mu_d:.4f} < {mu_tol:.4f} -> tau_2 = s_1 -> "
-                f"{rnd} s* ({len(tau2.tokens)} steps) added to D; joins tau_1 at state "
-                f"{tau2.join_idx}/{len(tau1.tokens)}, {row['sstar_dist_tau1']:.3f} m away")
-            break
-        start_q, start_emb = best.qs[j_star], best.embs[j_star]
-        start_hist, start_eef = best.tokens[:cut], s_star
-        start_hist_qu = best.tok_qu[:cut]
-
-    # ---- outputs ----
-    with open(os.path.join(outdir, "rounds.csv"), "w", newline="") as f:
+        with open(os.path.join(it_dir, "summary.json"), "w") as f:
+            json.dump(summary, f, indent=1)
+        if tau2 is not None:
+            np.savez(os.path.join(it_dir, "tau2.npz"), tokens=np.asarray(tau2.tokens),
+                     labels=tau2.labels, eefs=np.asarray(tau2.eefs), qs=np.asarray(tau2.qs),
+                     join_idx=tau2.join_idx)
+        if dnn is not None:
+            torch.save(dnn.state_dicts(), os.path.join(it_dir, "T_D_dnn.pt"))
+        else:
+            torch.save(T_D.state_dict(), os.path.join(it_dir, "T_D.pt"))
+        torch.save(T_exp.state_dict(), os.path.join(it_dir, "T_explore.pt"))
+        if policy is not None:
+            torch.save(policy.model.state_dict(), os.path.join(it_dir, "bc_model.pt"))
+        plot = (save_plots(it_dir, tau1, s1_eef, rounds_trajs, s_stars, task.cube_pos,
+                           chain_eefs, tau2 is not None,
+                           bc_eefs=None if bc_info is None else np.asarray(bc_info["eefs"]))
+                if rows else None)
+        log(f"\nstop={stop_reason} rounds={len(rows)} "
+            + (f"bc={bc_info['end']} " if bc_info else "")
+            + f"new trajectory={'yes' if tau2 else 'no'} | |D|={len(D)} | {time.time() - t_it:.0f}s")
+        html = write_html(it_dir, summary) if rows else None
         if rows:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            w.writeheader()
-            w.writerows(rows)
-    summary = dict(
-        stop_reason=stop_reason, fell_back=tau2 is not None, rounds=len(rows),
-        mu_tol=mu_tol, success_buffer_size=len(D),
-        tau1_len=len(tau1.tokens), s0=task.eef_start.tolist(), s1=s1_eef.tolist(),
-        cube=task.cube_pos.tolist(), wall_sec=time.time() - t0, config=asdict(cfg),
-        tau1_eefs=np.asarray(tau1.eefs).tolist(),
-        # T_D on its own demo; entry t is scored at token t, i.e. state t+1
-        tau1_q_td=list(tau1_q_td), tau1_mu_td=mu_tau1.tolist(),
-        s_stars=[s.tolist() for s in s_stars],
-        chain_eefs=np.asarray(chain_eefs).tolist(),     # fallback path s_1 -> ... -> last s*
-        state_scores=state_scores,
-        tau2=None if tau2 is None else dict(
-            eefs=np.asarray(tau2.eefs).tolist(), qs=np.asarray(tau2.qs).tolist(),
-            actions=[t[-3:].tolist() for t in tau2.tokens], labels=tau2.labels.tolist(),
-            join_idx=tau2.join_idx),
-        exploration=[[np.asarray(t.eefs).tolist() for t in trajs] for trajs in rounds_trajs],
-    )
-    with open(os.path.join(outdir, "summary.json"), "w") as f:
-        json.dump(summary, f, indent=1)
-    if tau2 is not None:
-        np.savez(os.path.join(outdir, "tau2.npz"), tokens=np.asarray(tau2.tokens),
-                 labels=tau2.labels, eefs=np.asarray(tau2.eefs), qs=np.asarray(tau2.qs),
-                 join_idx=tau2.join_idx)
-    if dnn is not None:
-        torch.save(dnn.state_dicts(), os.path.join(outdir, "T_D_dnn.pt"))
-    else:
-        torch.save(T_D.state_dict(), os.path.join(outdir, "T_D.pt"))
-    torch.save(T_exp.state_dict(), os.path.join(outdir, "T_explore.pt"))
-    plot = (save_plots(outdir, tau1, s1_eef, rounds_trajs, s_stars, task.cube_pos,
-                       chain_eefs, tau2 is not None) if rows else None)
-    log(f"\nstop={stop_reason} rounds={len(rows)} tau_2={'yes' if tau2 else 'no'} | "
-        f"|D|={len(D)} | {time.time() - t0:.0f}s total")
-    html = write_html(outdir, summary) if rows else None
-    log(f"outputs -> {outdir}/ (fallback.log, rounds.csv, summary.json, "
-        f"{'T_D_dnn.pt' if dnn is not None else 'T_D.pt'}, T_explore.pt"
-        f"{', tau2.npz' if tau2 else ''}{', ' + os.path.basename(plot) if plot else ''}"
-        f"{', ' + os.path.basename(html) if html else ''})")
+            write_html(it_dir, summary, path_only=True)     # fallback_path_3d.html
+        log(f"outputs -> {it_dir}/ (fallback.log, rounds.csv, summary.json, "
+            f"{'T_D_dnn.pt' if dnn is not None else 'T_D.pt'}, T_explore.pt"
+            f"{', bc_model.pt' if policy is not None else ''}"
+            f"{', tau2.npz' if tau2 else ''}{', ' + os.path.basename(plot) if plot else ''}"
+            f"{', ' + os.path.basename(html) + ', fallback_path_3d.html' if html else ''})")
+        # ---- iteration record ----
+        end_pt = np.asarray(chain_eefs[-1])
+        j_near = int(D_owner[np.linalg.norm(D_pts - end_pt, axis=1).argmin()])
+        it_rows.append(dict(
+            iteration=it, s1=np.asarray(s1_eef).round(4).tolist(), s1_side=s1_side,
+            s1_dist_tau1_cm=round(100 * min_dist_to([s1_eef], tau1_pts), 2),
+            s1_dist_D_cm=round(100 * min_dist_to([s1_eef], D_pts), 2),
+            stop=stop_reason, rounds=len(rows),
+            path_end_dist_D_cm=round(100 * min_dist_to([end_pt], D_pts), 2) if rows else None,
+            path_end_nearest_traj=j_near + 1 if rows else None,       # 1 = tau_1
+            bc=None if bc_info is None else bc_info["end"],
+            bc_steps=None if bc_info is None else bc_info["steps"],
+            added=tau2 is not None, D_size=len(D), sec=round(time.time() - t_it, 1)))
+
+    if multi:
+        write_iteration_outputs(outdir, it_rows, D, task.cube_pos, cfg.seed, log)
+
     task.close()
     logf.close()
     return summary
@@ -849,11 +1217,31 @@ def parse_args():
                    help="demo (tau_1) step length, m")
     p.add_argument("--action-step", type=float, default=d.action_step,
                    help="exploration action bound, m (keep >= --script-step)")
+    p.add_argument("--n-iters", type=int, default=d.n_iters,
+                   help="online iterations; each retrains the ensemble and BC on D, cold-starts "
+                        "T_explore, draws a fresh s_1 and adds a successful new trajectory to D")
+    p.add_argument("--bc", action=argparse.BooleanOptionalAction, default=None,
+                   help="train a BC policy on D inside the run and hand over to it when the "
+                        "fallback ends (unless stuck); default on with --td-model dnn")
+    p.add_argument("--bc-n-aug", type=int, default=d.bc_n_aug,
+                   help="BC corrective examples per state of each D trajectory")
+    p.add_argument("--bc-epochs", type=int, default=d.bc_epochs)
+    p.add_argument("--bc-lookahead", type=int, default=d.bc_lookahead)
+    p.add_argument("--bc-max-steps-mult", type=float, default=d.bc_max_steps_mult,
+                   help="BC rollout step limit = this x tau_1's length")
+    p.add_argument("--keep-best", action=argparse.BooleanOptionalAction, default=None,
+                   help="move to a round's s* only if its U beats the re-scored start "
+                        "(default: on with --td-model dnn; needs the DNN T_D)")
     p.add_argument("--fixed-step", action=argparse.BooleanOptionalAction, default=None,
                    help="every exploration / varied-demo action exactly --action-step long "
                         "(default: on with --td-model dnn, off with transformer)")
     p.add_argument("--s1-min-dist", type=float, default=d.s1_min_dist)
     p.add_argument("--s1-max-dist", type=float, default=d.s1_max_dist)
+    p.add_argument("--s1-dir", choices=["horizontal", "lateral", "any"], default=None,
+                   help="horizontal = any horizontal direction from s_0, s1-min..max-dist from "
+                        "the nearest state of any trajectory in D (default with --td-model dnn); "
+                        "lateral = the same but only left/right of tau_1; any = random 3-D "
+                        "direction, s1-min..max-dist from s_0 (transformer)")
     p.add_argument("--no-td-suffix-aug", action="store_true")
     p.add_argument("--token-fusion", default=d.token_fusion, choices=["sum", "concat", "wide_sum"])
     p.add_argument("--seed", type=int, default=d.seed)
@@ -870,16 +1258,20 @@ def parse_args():
         p.error("--keep-frac must be in (0, 1]")
     if a.n_dnn < 2:
         p.error("--n-dnn must be at least 2")
+    if a.keep_best and a.td_model != "dnn":
+        p.error("--keep-best needs --td-model dnn")
 
     cfg = FallbackConfig(
         k=a.k, m=a.m, max_rounds=a.max_rounds, max_retries=a.max_retries, gamma=a.gamma,
         keep_frac=a.keep_frac, mu_tol=a.mu_tol, td_epochs=a.td_epochs, explore_epochs=a.explore_epochs,
         mc_samples=a.mc_samples, script_step=a.script_step, action_step=a.action_step, s1_min_dist=a.s1_min_dist,
-        s1_max_dist=a.s1_max_dist, td_suffix_aug=not a.no_td_suffix_aug,
+        s1_max_dist=a.s1_max_dist, s1_dir=a.s1_dir, td_suffix_aug=not a.no_td_suffix_aug,
         token_fusion=a.token_fusion, seed=a.seed, device=a.device,
         td_model=a.td_model, n_dnn=a.n_dnn, dnn_epochs=a.dnn_epochs,
         n_probe_actions=a.n_probe_actions, demo=a.demo, demo_noise=a.demo_noise,
-        fixed_step=a.fixed_step)
+        fixed_step=a.fixed_step, keep_best=a.keep_best, bc=a.bc, bc_n_aug=a.bc_n_aug,
+        bc_epochs=a.bc_epochs, bc_lookahead=a.bc_lookahead,
+        bc_max_steps_mult=a.bc_max_steps_mult, n_iters=a.n_iters)
     enc_cfg = EncoderConfig(model_name=a.encoder, device=a.encoder_device, n_calib=a.n_calib)
     if a.smoke:
         cfg.k, cfg.m, cfg.max_rounds, cfg.td_epochs, cfg.explore_epochs = 3, 4, 2, 60, 10

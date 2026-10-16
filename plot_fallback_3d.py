@@ -79,6 +79,7 @@ def _sphere(center, r, n=18):
 
 
 PATH_COLOR = "#d61fd6"    # fallback path / tau_2: magenta, unlike every other trace
+BC_COLOR = "#1a9850"      # BC hand-off rollout: green
 
 
 def fallback_path(d: dict):
@@ -116,13 +117,18 @@ def _score_text(sc) -> str:
             f"<br>μ_explore {sc['mu_exp']:.4f} · {'in' if sc['in_S_prime'] else 'not in'} S′")
 
 
-def build_figure(d: dict):
+def build_figure(d: dict, path_only: bool = False):
     """Returns (traces, round_idx, mu_idx): indices of the traces shown in
     'colour by round' mode and in 'colour by mu_TD' mode (the rest are shown
-    in both)."""
+    in both). path_only leaves out every exploration trajectory (and with
+    them both colour modes): just tau_1, the fallback path and the markers."""
     T = np.asarray(d["tau1_eefs"], float)
     cube = np.asarray(d["cube"], float)
     traces, round_idx, mu_idx = [], [], []
+    # D during this iteration (tau_1 first); distances are to its nearest state
+    D_ref = [np.asarray(x, float) for x in d.get("D_eefs") or [d["tau1_eefs"]]]
+    TD = np.concatenate(D_ref)
+    ref_name = "τ₁" if len(D_ref) == 1 else "D"
     # per-round {(traj, step): scores}; step j >= 1 is the j-th new state
     scores = [{(sc["traj"], sc["step"]): sc for sc in rnd} for rnd in d.get("state_scores", [])]
     # tau_1 state j >= 1 is scored at token j - 1 (the step that led into it)
@@ -131,19 +137,23 @@ def build_figure(d: dict):
 
     # exploration, one legend entry per round (trajectories joined by None gaps)
     rounds = d.get("exploration", [])
-    s_stars = [np.asarray(s, float) for s in d.get("s_stars", [])]
-    for r, trajs in enumerate(rounds):
+    draw_rounds = [] if path_only else rounds          # what is drawn; `rounds` still
+    s_stars = [np.asarray(s, float) for s in d.get("s_stars", [])]   # feeds the lookups
+    # position -> scores, so path steps and s* can show their uncertainty
+    pos_score = {tuple(np.round(rounds[r][j][t], 9)): v
+                 for r in range(min(len(rounds), len(scores))) for (j, t), v in scores[r].items()}
+    for r, trajs in enumerate(draw_rounds):
         xs, ys, zs, hov = [], [], [], []
         for j, tr in enumerate(trajs):
             P = np.asarray(tr, float)
             if len(P) < 2:
                 continue
-            dd = _dist_to(P, T)
+            dd = _dist_to(P, TD)
             for t, (p, di) in enumerate(zip(P, dd)):
                 xs.append(p[0]); ys.append(p[1]); zs.append(p[2])
                 sc = scores[r].get((j, t)) if r < len(scores) else None
                 hov.append(f"round {r + 1} · traj {j} · step {t}<br>"
-                           f"{100 * di:.1f} cm from τ₁" + _score_text(sc))
+                           f"{100 * di:.1f} cm from {ref_name}" + _score_text(sc))
             xs.append(None); ys.append(None); zs.append(None); hov.append("")
         col = _viridis(r, len(rounds))
         round_idx.append(len(traces))
@@ -156,10 +166,13 @@ def build_figure(d: dict):
     dT = [f"τ₁ step {i}" + (f"<br>μ_TD {tau1_mu[i - 1]:.4f} (certainty {-tau1_mu[i - 1]:.4f})"
                              if tau1_mu and i >= 1 else "") for i in range(len(T))]
     traces.append(_line(T, "τ₁ (demo)", "black", 7, dT, size=4))
+    for j, E in enumerate(D_ref[1:], start=2):              # trajectories added in earlier iterations
+        traces.append(_line(E, f"τ{j} (in D)", "#555555", 4,
+                            [f"τ{j} step {i}" for i in range(len(E))], size=2))
 
     # ---- 'colour by mu_TD' mode ----
     pts, mus, syms, hovs = [], [], [], []
-    for r, trajs in enumerate(rounds):
+    for r, trajs in enumerate(draw_rounds):
         for j, tr in enumerate(trajs):
             P = np.asarray(tr, float)
             for t in range(1, len(P)):
@@ -169,9 +182,9 @@ def build_figure(d: dict):
                 pts.append(P[t]); mus.append(sc["mu_td"])
                 syms.append("circle" if sc["in_S_prime"] else "circle-open")
                 hovs.append(f"round {r + 1} · traj {j} · step {t}<br>"
-                            f"{100 * sc['dist_tau1']:.1f} cm from τ₁" + _score_text(sc))
+                            f"{100 * sc['dist_tau1']:.1f} cm from {ref_name}" + _score_text(sc))
     all_mu = mus + (list(tau1_mu) if tau1_mu else [])
-    if all_mu:
+    if all_mu and not path_only:
         cmin, cmax = (float(v) for v in np.percentile(all_mu, [2, 98]))
         bar = dict(title=dict(text="μ_TD<br>(blue = certain)" +
                               (f"<br>stop &lt; {mu_tol:.4f}" if mu_tol else ""), side="right"),
@@ -179,7 +192,7 @@ def build_figure(d: dict):
         if pts:
             # grey paths underneath, so the coloured states keep their context
             xs, ys, zs = [], [], []
-            for trajs in rounds:
+            for trajs in draw_rounds:
                 for tr in trajs:
                     for p in tr:
                         xs.append(p[0]); ys.append(p[1]); zs.append(p[2])
@@ -214,10 +227,16 @@ def build_figure(d: dict):
     tau2 = d.get("tau2")
     chain = fallback_path(d)
     if chain is not None and len(chain) > 1:
-        dc = _dist_to(chain, T)
-        name = (f"fallback path = τ₂ ({len(chain) - 1} steps)" if tau2 else
-                f"fallback path ({len(chain) - 1} steps, unfinished: no τ₂)")
-        hov = [f"fallback path step {i}<br>{100 * di:.1f} cm from τ₁" for i, di in enumerate(dc)]
+        dc = _dist_to(chain, TD)
+        if d.get("bc_rollout"):                 # tau_2 = this path + the BC rollout
+            name = (f"fallback path ({len(chain) - 1} steps)"
+                    + (" + BC rollout = τ₂" if tau2 else ", BC did not reach the cube: no τ₂"))
+        else:
+            name = (f"fallback path = τ₂ ({len(chain) - 1} steps)" if tau2 else
+                    f"fallback path ({len(chain) - 1} steps, unfinished: no τ₂)")
+        hov = [f"fallback path step {i}<br>{100 * di:.1f} cm from {ref_name}"
+               + _score_text(pos_score.get(tuple(np.round(p, 9))))
+               for i, (p, di) in enumerate(zip(chain, dc))]
         traces.append(_line(chain, name, PATH_COLOR, 9, hov, size=4))
         j = tau2.get("join_idx", -1) if tau2 else -1
         if 0 <= j < len(T):
@@ -225,9 +244,23 @@ def build_figure(d: dict):
                                 PATH_COLOR, 3, ["τ₂ end", f"τ₁ state {j}"], mode="lines",
                                 dash="dash"))
 
+    # BC hand-off: from the fallback path's end toward the cube (solid = reached)
+    bc = d.get("bc_rollout")
+    if bc and len(bc.get("eefs", [])) > 1:
+        B = np.asarray(bc["eefs"], float)
+        hov = [f"BC step {i}<br>{dd:.1f} cm from {ref_name}" for i, dd in enumerate(bc["dist"])]
+        tr = _line(B, f"BC rollout ({bc['steps']} steps) → "
+                      f"{'reached the cube' if bc['success'] else bc['end']}",
+                   BC_COLOR, 7, hov, size=3, dash=None if bc["success"] else "dash")
+        traces.append(tr)
+
     # s* per round
+    moved_flags = d.get("round_moved")
+    first_marker = True
     for r, s in enumerate(s_stars):
-        di = _dist_to(s[None], T)[0]
+        if moved_flags is not None and r < len(moved_flags) and not moved_flags[r]:
+            continue                            # keep-best "stay" round: no new s*
+        di = _dist_to(s[None], TD)[0]
         sc = None
         if r < len(scores) and r < len(rounds):
             for (j, t), v in scores[r].items():
@@ -235,23 +268,29 @@ def build_figure(d: dict):
                     sc = v
                     break
         tr = _point(s, f"s* round {r + 1}", "orange", "diamond", 6,
-                    f"s* round {r + 1}<br>{100 * di:.1f} cm from τ₁" + _score_text(sc))
+                    f"s* round {r + 1}<br>{100 * di:.1f} cm from {ref_name}" + _score_text(sc))
         tr["legendgroup"] = "sstar"
-        tr["showlegend"] = r == 0
-        if r == 0:
-            tr["name"] = "s* (per round)"
+        tr["showlegend"] = first_marker
+        if first_marker:
+            tr["name"] = "s* (rounds where the path moved)" if moved_flags else "s* (per round)"
+        first_marker = False
         traces.append(tr)
 
     # landmarks
     traces.append(_point(d["s0"], "s₀ (τ₁ start)", "black", "square", 7, "s₀"))
     s1 = np.asarray(d["s1"], float)
     traces.append(_point(s1, "s₁ (exploration start)", "royalblue", "circle", 7,
-                         f"s₁<br>{100 * _dist_to(s1[None], T)[0]:.1f} cm from τ₁"))
+                         f"s₁<br>{100 * _dist_to(s1[None], T)[0]:.1f} cm from τ₁"
+                         + (f", {100 * _dist_to(s1[None], TD)[0]:.1f} cm from D" if len(D_ref) > 1 else "")))
     traces.append(_point(cube, "cube", "red", "square", 9, "cube centre"))
     traces.append(_sphere(cube, EPS_DIST))
 
     # table top under everything that was plotted
-    allp = [T, cube[None], s1[None]] + [np.asarray(t, float) for tr in rounds for t in tr if t]
+    allp = [T, cube[None], s1[None]] + [np.asarray(t, float) for tr in draw_rounds for t in tr if t]
+    if chain is not None:
+        allp.append(np.asarray(chain, float))
+    if bc and bc.get("eefs"):
+        allp.append(np.asarray(bc["eefs"], float))
     A = np.concatenate(allp)
     pad = 0.05
     x0, x1 = A[:, 0].min() - pad, A[:, 0].max() + pad
@@ -272,18 +311,28 @@ def _box(P: np.ndarray, pad: float):
                 ratio=[float(r) for r in ratio])
 
 
-def write_html(run_dir: str, summary: dict = None) -> str:
+def write_html(run_dir: str, summary: dict = None, path_only: bool = False) -> str:
+    """Writes fallback_3d.html (everything), or with path_only
+    fallback_path_3d.html: tau_1 and the fallback path without the
+    exploration trajectories."""
     if summary is None:
         with open(os.path.join(run_dir, "summary.json")) as f:
             summary = json.load(f)
-    traces, round_idx, mu_idx = build_figure(summary)
-    # close-up box: exploration, s_1, s* and tau_2 (tau_1 / table / cube are
-    # still drawn, just clipped to this box)
+    traces, round_idx, mu_idx = build_figure(summary, path_only)
+    # close-up box: exploration (or, path_only, the fallback path), s_1 and
+    # tau_2 (tau_1 / table / cube are still drawn, just clipped to this box)
     pts = [np.asarray(summary["s1"], float)[None]]
-    pts += [np.asarray(t, float) for trajs in summary.get("exploration", [])
-            for t in trajs if len(t)]
+    if path_only:
+        chain = fallback_path(summary)
+        if chain is not None:
+            pts.append(np.asarray(chain, float))
+    else:
+        pts += [np.asarray(t, float) for trajs in summary.get("exploration", [])
+                for t in trajs if len(t)]
     if summary.get("tau2"):
         pts.append(np.asarray(summary["tau2"]["eefs"], float))
+    if (summary.get("bc_rollout") or {}).get("eefs"):
+        pts.append(np.asarray(summary["bc_rollout"]["eefs"], float))
     # ...plus the stretch of tau_1 nearest to them, so the fall-back target stays in view
     E = np.concatenate(pts)
     T = np.asarray(summary["tau1_eefs"], float)
@@ -298,7 +347,7 @@ def write_html(run_dir: str, summary: dict = None) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fallback 3D view</title>
+<title>{"Fallback path" if path_only else "Fallback 3D view"}</title>
 <script src="{PLOTLY_JS}"></script>
 <style>
   html, body {{ margin: 0; height: 100%; background: #fafafa; color: #222;
@@ -316,7 +365,8 @@ def write_html(run_dir: str, summary: dict = None) -> str:
 </head>
 <body>
 <header>
-  <h1>Fallback to τ₁: exploration in 3D (EEF positions)</h1>
+  <h1>{"Fallback path vs τ₁ (EEF positions, exploration hidden)" if path_only
+        else "Fallback to τ₁: exploration in 3D (EEF positions)"}</h1>
   <div class="sub">{stats} · drag = rotate, scroll = zoom, right-drag = pan,
     click legend = show/hide, hover = details</div>
 </header>
@@ -327,7 +377,7 @@ def write_html(run_dir: str, summary: dict = None) -> str:
   <button data-eye="0,-2.4,0.1">Side (−y)</button>
   <button id="reset">Reset</button>
   <span style="margin-left:10px">Zoom:</span>
-  <button id="close">Exploration close-up</button>
+  <button id="close">{"Path close-up" if path_only else "Exploration close-up"}</button>
   <button id="full">Full scene</button>
   <span class="colour" style="margin-left:10px">Colour:</span>
   <button class="colour" id="by-round">By round</button>
@@ -374,7 +424,7 @@ document.getElementById("full").onclick = () => Plotly.relayout("plot", {{
 </body>
 </html>
 """
-    path = os.path.join(run_dir, "fallback_3d.html")
+    path = os.path.join(run_dir, "fallback_path_3d.html" if path_only else "fallback_3d.html")
     with open(path, "w") as f:
         f.write(page)
     return path
@@ -385,3 +435,4 @@ if __name__ == "__main__":
         sys.exit("usage: python plot_fallback_3d.py <run_dir> [<run_dir> ...]")
     for run_dir in sys.argv[1:]:
         print("wrote", write_html(run_dir))
+        print("wrote", write_html(run_dir, path_only=True))

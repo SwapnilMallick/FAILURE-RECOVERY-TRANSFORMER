@@ -19,6 +19,7 @@ fallback_results_4/
 fallback_results_5/
 
 *_results/
+*_results_*/
 *.pt
 *.pth
 *.ckpt
