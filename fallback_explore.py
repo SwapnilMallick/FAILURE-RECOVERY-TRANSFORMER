@@ -262,7 +262,8 @@ class FallbackConfig:
     bc_n_aug: int = 20                   # corrective examples per state of each D trajectory
     bc_epochs: int = 500
     bc_lookahead: int = 2
-    bc_max_steps_mult: float = 2.0       # rollout step limit = this x tau_1's length
+    bc_max_steps_mult: float = 3.0       # rollout step limit = this x tau_1's length (was 2.0;
+                                         # raise further when s_1 moves out to 10-15 cm)
     keep_best: Optional[bool] = None     # move to s* only if it beats the (re-scored) start;
                                          # None = True for dnn, False for transformer
     keep_frac: Optional[float] = None    # S' = top keep_frac of visited states by mu_exp;
