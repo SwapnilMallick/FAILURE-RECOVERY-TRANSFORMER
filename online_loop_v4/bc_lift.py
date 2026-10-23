@@ -24,8 +24,9 @@ Labels (per trajectory in D, `lookahead` k):
       approach states: nearest among the approach states, target index capped
         at T (unchanged from v3);
       descend states: nearest among the approach + descend states, target
-        index capped at the last descend state (never toward the grasp/lift),
-        and placements touching the cube are rejected.
+        index capped at the end of the descent = the grasp pose (the state
+        after the last descend action; never toward the lift), and placements
+        touching the cube are rejected.
 Loss: squared error on the 6 motion outputs + binary cross-entropy on the
 gripper.
 
@@ -108,7 +109,7 @@ def build_bc_lift_dataset(env, encoder, trajs, cfg: BCLiftConfig, log=print) -> 
         pool_d = appr + desc
         for i in appr + desc:                                  # corrective, approach + descend
             is_desc = tr.phases[i] == "descend"
-            pool, j_cap = (pool_d, desc[-1]) if is_desc else (appr, T)
+            pool, j_cap = (pool_d, desc[-1] + 1) if is_desc else (appr, T)
             for _ in range(cfg.n_aug):
                 for _try in range(cfg.aug_tries):
                     env.set_state(tr.states[i])
