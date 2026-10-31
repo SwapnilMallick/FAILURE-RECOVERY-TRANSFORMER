@@ -18,23 +18,32 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 def load(run_dir):
+    """seed -> (rows, running). iterations.csv is only written when a seed
+    finishes; for a seed still running, the per-iteration 'stop=... new
+    trajectory=yes|no' lines of its fallback.log are used instead."""
     seeds = {}
-    for f in glob.glob(os.path.join(run_dir, "seed*", "iterations.csv")):
-        sd = int(re.search(r"seed(\d+)", f).group(1))
-        rows = list(csv.DictReader(open(f)))
-        seeds[sd] = [(int(r["iteration"]), int(r["added"] == "True")) for r in rows]
+    for d in glob.glob(os.path.join(run_dir, "seed*")):
+        sd = int(re.search(r"seed(\d+)$", d).group(1))
+        f = os.path.join(d, "iterations.csv")
+        if os.path.exists(f):
+            rows = list(csv.DictReader(open(f)))
+            seeds[sd] = ([(int(r["iteration"]), int(r["added"] == "True")) for r in rows], False)
+        elif os.path.exists(os.path.join(d, "fallback.log")):
+            ends = [m.group(1) for m in (re.match(r"stop=.* new trajectory=(yes|no)", l)
+                                         for l in open(os.path.join(d, "fallback.log"))) if m]
+            seeds[sd] = ([(i + 1, int(e == "yes")) for i, e in enumerate(ends)], True)
     return dict(sorted(seeds.items()))
 
 
 def plot(run_dir):
     seeds = load(run_dir)
-    n_it = max(len(v) for v in seeds.values())
+    n_it = max(len(v[0]) for v in seeds.values())
     fig, axes = plt.subplots(5, 4, figsize=(18, 16), sharex=True, sharey=True)
-    for ax, (sd, rows) in zip(axes.flat, seeds.items()):
+    for ax, (sd, (rows, running)) in zip(axes.flat, seeds.items()):
         it = [r[0] for r in rows]
         rew = [r[1] for r in rows]
         ax.plot(it, rew, color="tab:blue", lw=0.8, marker="o", ms=3)
-        ax.set_title(f"seed {sd}: {sum(rew)}/{len(rew)} lifted", fontsize=10)
+        ax.set_title(f"seed {sd}: {sum(rew)}/{len(rew)} lifted" + (" (still running)" if running else ""), fontsize=10)
         ax.set_yticks([0, 1])
         ax.set_ylim(-0.15, 1.15)
         ax.set_xlim(0, n_it + 1)
